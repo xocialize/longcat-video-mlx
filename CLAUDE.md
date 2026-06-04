@@ -35,7 +35,7 @@ mirror them manually if they touch shared modules.
 | `cfg_step_lora` + `refinement_lora` registration | NEW |
 | T2V / I2V / Continuation pipelines | NEW |
 | Coarse-to-fine refinement (latent upsampling between passes, LoRA hot-swap) | NEW |
-| Block Sparse Attention (Tier A pure-MLX → Tier B Metal kernel) | NEW |
+| Block Sparse Attention (Tier A pure-MLX + Tier B Metal kernel Phases 1–4) | NEW |
 | Long-Video / Interactive orchestration | NEW |
 
 What we **dropped** from Avatar: Whisper encoder, AudioProjModel,
