@@ -5,15 +5,19 @@ PyTorch reference: `refs/longcat-video/longcat_video/modules/attention.py`.
 Two classes:
 - `Attention` — visual self-attention with QKNorm + 3D RoPE. Supports the
   `num_cond_latents` branching for image-to-video / video-continuation modes.
-  Returns optional KV cache for long-video continuation.
+  Returns optional KV cache for long-video continuation. **Optionally routes
+  through Block Sparse Attention** (`enable_bsa=True`) for the 720p refinement
+  pass — see `block_sparse_attention.py` (B3.2 Tier A pure-MLX; B4.1 Tier B
+  Metal kernel).
 - `MultiHeadCrossAttention` — text cross-attention. Handles the
   variable-length-text packed format: text tokens for the whole batch are
   concatenated into a single sequence `[1, N_valid_total, C]` with
   `kv_seqlen=[N_per_batch_i]`. We build a block-diagonal mask for SDPA.
 
-All CUDA-only attention backends (FlashAttention v2/v3, xformers, BSA, ulysses)
-are replaced with `mx.fast.scaled_dot_product_attention` (dense). Per
-CLAUDE.md L10 expect ~1e-3 max_abs drift vs PT-CPU on Metal-GPU fp32.
+CUDA-only flash backends (FlashAttention v2/v3, xformers, ulysses) are
+replaced with `mx.fast.scaled_dot_product_attention` (dense). BSA is the
+exception — it has a pure-MLX Tier A implementation that's mathematically
+correct (not yet fast); Tier B will be a Metal kernel.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from longcat_video.models.block_sparse_attention import bsa_attention
 from longcat_video.models.blocks import RMSNorm_FP32
 from longcat_video.models.rope_3d import RotaryPositionalEmbedding
 
@@ -51,10 +56,45 @@ class Attention(nn.Module):
 
         self.rope_3d = RotaryPositionalEmbedding(self.head_dim)
 
-    def _process_attn(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
-        """Dense SDPA wrapper. PT version branches over flash/bsa/xformers — we
-        only have dense on Metal. q/k/v: [B, H, S, D]. Returns [B, H, S_q, D].
+        # BSA opt-in. Flip these on at the model level (typically by the
+        # refinement-pass setup in `scripts/run_refine.py`). BSA params
+        # come from the published `dit/config.json` — `bsa_params` block.
+        self.enable_bsa: bool = False
+        self.bsa_sparsity: float = 0.9375
+        self.bsa_chunk_thw: tuple[int, int, int] = (4, 4, 4)
+
+    def _process_attn(
+        self,
+        q: mx.array, k: mx.array, v: mx.array,
+        shape: Optional[tuple[int, int, int]] = None,
+    ) -> mx.array:
+        """Attention wrapper — dense SDPA, or Block Sparse if `enable_bsa`.
+
+        Args:
+            q, k, v: [B, H, S, D]
+            shape:   (T_lat, H_lat, W_lat) — REQUIRED when enable_bsa=True
+                     so BSA can group tokens into 3-D blocks. Pass `None`
+                     (default) for the cond-noise mixed branch where the
+                     K side spans both ranges; that path falls back to
+                     dense even with BSA on (so refinement's cond-noise
+                     boundary is handled cleanly).
+
+        Returns: [B, H, S_q, D].
         """
+        if self.enable_bsa and shape is not None and q.shape[-2] == k.shape[-2]:
+            # Pure self-attention with aligned Q/K — BSA-safe.
+            try:
+                return bsa_attention(
+                    q, k, v, shape=shape,
+                    sparsity=self.bsa_sparsity,
+                    chunk_thw=self.bsa_chunk_thw,
+                    sm_scale=self.scale,
+                )
+            except ValueError:
+                # Shape isn't a multiple of chunk_thw — refinement padding
+                # should make this impossible, but fall back rather than
+                # break the forward pass.
+                pass
         return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
 
     def __call__(
@@ -88,14 +128,20 @@ class Attention(nn.Module):
             q_cond = q[:, :, :ncl_thw]
             k_cond = k[:, :, :ncl_thw]
             v_cond = v[:, :, :ncl_thw]
-            x_cond = self._process_attn(q_cond, k_cond, v_cond)
+            # Cond-only branch: shape is (num_cond_latents, H, W) — use BSA
+            # if cond is a multiple of 4. Otherwise the BSA wrapper falls
+            # back internally.
+            cond_shape = (num_cond_latents, shape[1], shape[2])
+            x_cond = self._process_attn(q_cond, k_cond, v_cond, shape=cond_shape)
 
+            # Noise-attending-to-cond+noise branch: Q seq length differs
+            # from K, so pass shape=None to force dense fallback.
             q_noise = q[:, :, ncl_thw:]
-            x_noise = self._process_attn(q_noise, k, v)
+            x_noise = self._process_attn(q_noise, k, v, shape=None)
 
             out = mx.concatenate([x_cond, x_noise], axis=2)
         else:
-            out = self._process_attn(q, k, v)
+            out = self._process_attn(q, k, v, shape=shape)
 
         # [B, H, N, D] -> [B, N, H, D] -> [B, N, C]
         out = out.transpose(0, 2, 1, 3).reshape(B, N, C)
@@ -142,7 +188,8 @@ class Attention(nn.Module):
             k_full = mx.concatenate([k_cache, k], axis=2)
             v_full = mx.concatenate([v_cache, v], axis=2)
 
-        out = self._process_attn(q, k_full, v_full)
+        # KV-cache continuation: Q seq != KV seq, so dense fallback.
+        out = self._process_attn(q, k_full, v_full, shape=None)
         out = out.transpose(0, 2, 1, 3).reshape(B, N, C)
         return self.proj(out)
 
