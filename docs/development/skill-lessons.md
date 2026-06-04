@@ -956,6 +956,136 @@ immediately after an upload completes. Either:
 
 ---
 
+## L47. Run upstream PT references via `sys.modules` swap + stubs `[toolkit candidate]`
+
+**What we hit:** B5.3 parity validation needed to forward our small MLX
+DiT block AND upstream's PT DiT block on the same inputs and compare.
+Problem: upstream's `longcat_video/modules/longcat_video_dit.py` imports
+heavily from distributed-training infra that doesn't exist on a single-
+GPU / CPU machine:
+
+```python
+from ..context_parallel import context_parallel_util
+from ..context_parallel.ulysses_wrapper import ulysses_wrapper
+from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
+```
+
+PLUS our installed `longcat_video` package shadows upstream's package
+of the same name. Naive `sys.path.insert(0, refs/...)` loads the
+wrong module.
+
+**Solution pattern** (now codified in
+`tests/parity/test_dit_block_parity.py::upstream_pt_block` fixture):
+
+```python
+import sys, types
+# 1. Snapshot any installed longcat_video.* modules
+saved = {k: v for k, v in sys.modules.items()
+         if k == "longcat_video" or k.startswith("longcat_video.")}
+for k in list(saved): del sys.modules[k]
+
+# 2. Build a virtual "longcat_video" package rooted at refs/
+lc = types.ModuleType("longcat_video"); lc.__path__ = [str(REFS / "longcat_video")]
+sys.modules["longcat_video"] = lc
+
+# 3. Inject stubs for distributed-training infra so the upstream code
+#    loads. The actual forward path doesn't use any of these — they're
+#    only present at import time.
+cp = types.ModuleType("longcat_video.context_parallel"); cp.__path__ = []
+# (build cp.context_parallel_util / cp.ulysses_wrapper here)
+sys.modules["longcat_video.context_parallel"] = cp
+
+# 4. Load the target via importlib.util.spec_from_file_location
+spec = importlib.util.spec_from_file_location(
+    "longcat_video.modules.longcat_video_dit",
+    REFS / "longcat_video" / "modules" / "longcat_video_dit.py",
+)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+
+# 5. Teardown: restore the snapshot so other tests see our installed pkg
+yield mod.LongCatSingleStreamBlock
+for k in list(sys.modules):
+    if k == "longcat_video" or k.startswith("longcat_video."):
+        del sys.modules[k]
+sys.modules.update(saved)
+```
+
+ALSO: pre-import the MLX equivalent at module-level **before** the
+fixture runs. Otherwise the test function's `from longcat_video.models...`
+resolves to upstream's virtual package, which doesn't have a `.models.`
+subpath.
+
+ALSO: upstream's attention dispatch raises `RuntimeError("Unsupported
+attention operations.")` when none of flash-attn / xformers / BSA is
+available (i.e., CPU). Monkey-patch `_process_attn` (visual self-attn)
+and `forward` (cross-attn — its dispatch is inline) with `torch.nn.
+functional.scaled_dot_product_attention` for the test.
+
+ALSO: upstream's RoPE module unconditionally subscripts `cp_split_hw[0]`
+— pass `cp_split_hw=[1, 1]` to the block constructor to work around
+this single-GPU latent bug.
+
+**Rule for next port:** When PT-side parity needs upstream code that
+has distributed-training entanglement:
+
+1. **Don't** add upstream as a path-style import — it WILL collide with
+   your installed package
+2. **Snapshot + restore `sys.modules`** for the colliding namespace
+3. **Pre-import** your MLX equivalent at module level
+4. **Stub** distributed-training infra to no-op modules
+5. **Monkey-patch** any CUDA-only attention dispatches to PT's SDPA
+6. **Catch** known upstream single-GPU latent bugs (e.g.
+   `cp_split_hw=None`) by passing safe defaults
+
+Result for this port: DiT block parity **8.94e-08 max_abs** on fp32
+CPU stream — bit-for-bit equivalent at the random-init small-block
+scale.
+
+**Skill update target:** add to `parity-testing.md` as the canonical
+pattern for "PT module needs distributed-training stubs to load."
+Tagged toolkit-candidate because every port that wants single-block
+PT parity hits this exact problem.
+
+**Artifacts:**
+- `tests/parity/test_dit_block_parity.py::upstream_pt_block`
+- `tests/parity/_helpers.py` (Avatar pattern)
+
+---
+
+## L48. Parity numbers travel; capture them in a baseline doc
+
+**What we hit:** B5.3 produced concrete max_abs numbers for the DiT
+block (8.94e-08), VAE encode (8.05e-06), VAE decode (1.17e-02), umT5
+keymap (✅), DiT keymap (✅, 1022 keys). These numbers are the
+**ground truth** for future regression detection — if the next change
+moves the DiT block from 8.94e-08 to 1e-4, that's a 10,000× regression
+even though "still passing." But without writing them down, that
+regression is invisible.
+
+The solution: a `docs/development/parity-baseline.md` that records
+each test, its threshold, its current value, and the reproduce
+command. Update the file whenever the numbers shift. Treat it as a
+**checked-in benchmark**.
+
+**Rule for next port:** Don't just write `assert max_abs < threshold`
+and walk away. Record the **achieved** max_abs in a baseline file,
+along with mean_abs and rel_err. The threshold is the failure trip
+wire; the baseline is the regression detector.
+
+When a test starts failing, the diff between baseline and current run
+points at the divergent op much faster than re-running with print
+statements.
+
+**Skill update target:** add to `parity-testing.md` as
+"Record baseline numbers, not just thresholds." Standard practice
+for benchmark suites; under-applied for parity suites.
+
+**Artifact:** `docs/development/parity-baseline.md`.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -971,7 +1101,7 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L46):**
+**Added in this port (L23–L48):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
@@ -987,5 +1117,10 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
   (embed `skip_patterns` in published config.json — self-describing)
 - **L45: Quant variants reuse non-DiT components verbatim** (only
   quantize what's > 5 GB; copy VAE / umT5 / LoRAs)
+- **L47: Run upstream PT via `sys.modules` swap + stubs** (the canonical
+  pattern for "PT module needs distributed-training stubs to load on
+  single-GPU / CPU")
+- L48: Record parity BASELINE numbers, not just thresholds (regression
+  detector that catches "still passing but 10,000× worse")
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.
