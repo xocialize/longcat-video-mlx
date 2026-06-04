@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+build/
+dist/
+
+# Venv
+.venv/
+venv/
+
+# Reference checkouts (re-clone per CLAUDE.md)
+refs/
+
+# Notes / scratch
+notes/
+scratch/
+
+# Output / large artifacts
+*.npy
+*.safetensors
+*.mp4
+*.png
+*.jpg
+*.wav
+*.mp3
+weights/
+outputs/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
