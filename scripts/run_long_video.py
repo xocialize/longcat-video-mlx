@@ -35,6 +35,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from _common import (
     encode_prompts,
     load_components,
+    merge_lora,
     save_video_mp4,
 )
 
@@ -67,8 +68,19 @@ def build_pipeline(
     )
 
     if with_cfg_step_lora:
-        print("  cfg_step_lora flag set — merge wiring lands in B1.5 follow-up; "
-              "ignoring for now and using baseline 50-step CFG path.")
+        merge_lora(dit, variant_dir, "cfg_step_lora")
+        # Flip BOTH sub-pipelines (T2V seed + chained Continuation) to fast mode
+        for sub_cfg in (pipeline.t2v.config, pipeline.continuation.config):
+            sub_cfg.cfg_collapse = True
+            sub_cfg.num_sampling_steps = 8
+            sub_cfg.text_guidance_scale = 0.0
+        # Also reflect on the top-level config for visibility
+        cfg.cfg_collapse = True
+        cfg.num_sampling_steps = 8
+        cfg.text_guidance_scale = 0.0
+        print(f"  [cfg_step_lora] pipeline flipped to fast mode: "
+              f"cfg_collapse=True, 8 steps, guidance_scale=0 "
+              f"(applies to both T2V seed + Continuation segments)")
 
     return pipeline, cfg, variant_dir
 

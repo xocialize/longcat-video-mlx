@@ -1,14 +1,15 @@
 """Shared helpers for the LongCat-Video MLX CLIs.
 
-`run_t2v.py`, `run_i2v.py`, and `run_continuation.py` all need to:
+All `run_*.py` CLIs share these primitives so the per-CLI files stay thin:
 
 1. Load the converted bf16 weights (VAE / umT5 / DiT — all three sharded).
-2. Tokenize a prompt via the umT5 tokenizer.
+2. Tokenize + encode prompts via the umT5 tokenizer.
 3. Encode an image (I2V) or video clip (Continuation) into VAE latents.
-4. Save the decoded video as an .mp4 (+ .npy sidecar).
+4. **Hot-swap-merge a LoRA** into the DiT (`cfg_step_lora`,
+   `refinement_lora`) before inference — one helper, one call.
+5. Save the decoded video as an .mp4 (+ .npy sidecar).
 
-This module is the single source of truth for that plumbing — keep CLIs
-thin, do the actual work here.
+Single source of truth — if a behavior is in multiple CLIs, it lives here.
 """
 
 from __future__ import annotations
@@ -216,3 +217,91 @@ def postprocess_video(video: mx.array) -> np.ndarray:
     return (
         np.asarray(video).transpose(0, 2, 3, 4, 1)[0] * 127.5 + 127.5
     ).clip(0, 255).astype(np.uint8)
+
+
+# -------------------- LoRA merge ----------------------------------------
+
+def load_lora_state_dict(lora_path: pathlib.Path) -> dict:
+    """Load a `.safetensors` LoRA file into an MLX state dict.
+
+    Returns `{key: mx.array}` ready for `merge_lora_into_model`.
+
+    Uses the numpy framework backend so we don't pull in torch at runtime.
+    """
+    from safetensors import safe_open
+
+    if not lora_path.exists():
+        raise FileNotFoundError(
+            f"LoRA file not found: {lora_path}\n"
+            f"Run the conversion recipe first: "
+            f"`python -m recipes.convert_longcat_video --out <PATH>`"
+        )
+
+    state_dict: dict[str, mx.array] = {}
+    with safe_open(str(lora_path), framework="numpy") as f:
+        for k in f.keys():
+            state_dict[k] = mx.array(f.get_tensor(k))
+    return state_dict
+
+
+def merge_lora(
+    dit,
+    variant_dir: pathlib.Path,
+    name: str,
+    multiplier: float = 1.0,
+    verbose: bool = True,
+) -> dict[str, list[str]]:
+    """Convenience wrapper: load + merge a LoRA into the DiT in one call.
+
+    Args:
+        dit: the MLX DiT module (`LongCatVideoTransformer3DModel` instance).
+        variant_dir: path to `LongCat-Video-bf16/` (parent of `lora/`).
+        name: `"cfg_step_lora"` or `"refinement_lora"`.
+        multiplier: per-LoRA strength (default 1.0; matches PT runtime).
+        verbose: print applied/unmapped counts.
+
+    Returns: `{"applied": [...], "unmapped": [...]}` from
+        `merge_lora_into_model` — useful for the caller to assert
+        no surprises.
+
+    Raises:
+        FileNotFoundError: if the LoRA file is missing.
+        AssertionError: if zero modules were merged (something is wrong
+            with the LoRA file or the DiT module tree — a no-op merge
+            would silently produce wrong outputs, so we fail loudly).
+    """
+    from longcat_video.lora import merge_lora_into_model
+
+    lora_path = variant_dir / "lora" / f"{name}.safetensors"
+    if verbose:
+        print(f"  [{name}] loading {lora_path.name} ({lora_path.stat().st_size / 1e9:.1f} GB)...")
+    sd = load_lora_state_dict(lora_path)
+
+    if verbose:
+        print(f"  [{name}] merging {len(sd)} tensors into DiT...")
+    result = merge_lora_into_model(dit, sd, multiplier=multiplier)
+
+    n_applied = len(result["applied"])
+    n_unmapped = len(result["unmapped"])
+    if verbose:
+        print(f"  [{name}] merged {n_applied} modules, {n_unmapped} unmapped")
+        if n_unmapped and n_unmapped < 10:
+            for path in result["unmapped"]:
+                print(f"      unmapped: {path}")
+        elif n_unmapped:
+            for path in result["unmapped"][:5]:
+                print(f"      unmapped: {path}")
+            print(f"      ... and {n_unmapped - 5} more")
+
+    assert n_applied > 0, (
+        f"{name}: 0 modules merged — LoRA target paths don't match the "
+        f"DiT module tree. A no-op merge would silently produce wrong "
+        f"output, so failing loudly. Check lora.decode_module_name's "
+        f"output against dict(tree_flatten(dit.parameters())).keys()."
+    )
+
+    # Free the LoRA state dict before returning — the delta is already in
+    # the DiT weights now, so the LoRA arrays are no longer needed and
+    # can release ~2-3 GB of unified memory.
+    del sd
+    return result

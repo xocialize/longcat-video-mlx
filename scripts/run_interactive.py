@@ -42,6 +42,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from _common import (
     encode_prompts,
     load_components,
+    merge_lora,
     save_video_mp4,
 )
 
@@ -63,6 +64,7 @@ def build_pipeline(
     num_cond_frames: int,
     height: int,
     width: int,
+    with_cfg_step_lora: bool = False,
 ):
     from longcat_video.pipeline_interactive import (
         InteractivePipelineConfig,
@@ -80,6 +82,20 @@ def build_pipeline(
     pipeline = LongCatVideoInteractivePipeline(
         vae=vae, text_encoder=umt5, dit=dit, config=cfg,
     )
+
+    if with_cfg_step_lora:
+        merge_lora(dit, variant_dir, "cfg_step_lora")
+        for sub_cfg in (pipeline.t2v.config, pipeline.continuation.config):
+            sub_cfg.cfg_collapse = True
+            sub_cfg.num_sampling_steps = 8
+            sub_cfg.text_guidance_scale = 0.0
+        cfg.cfg_collapse = True
+        cfg.num_sampling_steps = 8
+        cfg.text_guidance_scale = 0.0
+        print(f"  [cfg_step_lora] pipeline flipped to fast mode: "
+              f"cfg_collapse=True, 8 steps, guidance_scale=0 "
+              f"(applies to both T2V seed + Continuation segments)")
+
     return pipeline, cfg, variant_dir
 
 
@@ -102,6 +118,9 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--cfg-step-lora", action="store_true",
+                        help="Pre-merge cfg_step_lora for the fast path "
+                             "(applies to both T2V seed + Continuation segments)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=pathlib.Path,
                         default=pathlib.Path("output_interactive.mp4"))
@@ -146,6 +165,7 @@ def main():
     pipeline, cfg, variant_dir = build_pipeline(
         args.weights, args.num_frames_per_segment, args.num_cond_frames,
         args.height, args.width,
+        with_cfg_step_lora=args.cfg_step_lora,
     )
     if args.num_steps:
         pipeline.t2v.config.num_sampling_steps = args.num_steps

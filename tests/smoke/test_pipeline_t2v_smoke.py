@@ -34,3 +34,49 @@ def test_pipeline_import_chain():
     from longcat_video.models.longcat_video_dit import LongCatVideoTransformer3DModel
     from longcat_video.models.umt5 import UMT5EncoderModel
     assert LongCatVideoT2VPipeline is not None
+
+
+def test_cfg_collapse_normalizes_scalar_timestep():
+    """Regression: cfg_collapse=True path used to skip the ndim==0 → [B=1]
+    normalization that the 2-pass branch does. Scheduler returns 0-d
+    timestep arrays, which then trickled through to the DiT and made
+    `timestep.flatten()` collapse to (1,) instead of (B*N_t,) — silently
+    corrupting the t_embedder output (256 instead of 512). Real-weights
+    crash signature: `Last dimension of first input with shape (1, T, 256)
+    must match second to last dimension of second input with shape (512,
+    24576)` from inside `adaLN_modulation[1]`.
+
+    Verifies the normalization by stubbing the DiT and asserting it
+    receives a 1-D timestep, not a scalar.
+    """
+    import mlx.core as mx
+
+    from longcat_video.pipeline_t2v import LongCatVideoT2VPipeline, T2VPipelineConfig
+
+    cfg = T2VPipelineConfig(cfg_collapse=True, num_sampling_steps=1)
+    received_ndim = []
+
+    class StubDiT:
+        def __call__(self, lat, t, *a, **kw):
+            received_ndim.append(int(t.ndim))
+            return mx.zeros_like(lat)
+
+    pipe = LongCatVideoT2VPipeline(
+        vae=None, text_encoder=None, dit=StubDiT(),
+        config=cfg, scheduler=None,
+    )
+    # 0-d (scalar) timestep — exactly what mlx-arsenal's scheduler emits
+    t_scalar = mx.array(500.0)
+    text_cat = mx.zeros((2, 1, 16, 4096))
+    mask_cat = mx.ones((2, 16))
+    pipe._cfg_forward(
+        latents=mx.zeros((1, 16, 2, 4, 4)),
+        timestep=t_scalar,
+        text_embeds_cat=text_cat,
+        text_mask_cat=mask_cat,
+        uncond_text_embeds=text_cat[:1],
+        uncond_text_mask=mask_cat[:1],
+    )
+    assert received_ndim == [1], (
+        f"DiT should receive timestep with ndim=1, got ndim={received_ndim[0]}"
+    )

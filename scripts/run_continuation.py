@@ -39,6 +39,7 @@ from _common import (
     encode_prompts,
     load_components,
     load_video,
+    merge_lora,
     postprocess_video,
     save_video_mp4,
 )
@@ -58,8 +59,13 @@ def build_pipeline(weights_dir: pathlib.Path, with_cfg_step_lora: bool):
     )
 
     if with_cfg_step_lora:
-        print("  cfg_step_lora flag set — merge wiring lands in B1.5; "
-              "ignoring for now and using baseline 50-step CFG path.")
+        merge_lora(dit, variant_dir, "cfg_step_lora")
+        cfg.cfg_collapse = True
+        cfg.num_sampling_steps = 8
+        cfg.text_guidance_scale = 0.0
+        print(f"  [cfg_step_lora] pipeline flipped to fast mode: "
+              f"cfg_collapse=True, {cfg.num_sampling_steps} steps, "
+              f"guidance_scale=0")
 
     return pipeline, cfg, variant_dir
 
