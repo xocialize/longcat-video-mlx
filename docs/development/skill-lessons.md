@@ -800,6 +800,162 @@ branches, audit them for *every* normalization the other branch does.
 
 ---
 
+## L43. Quantize-from-already-converted-bf16, don't re-walk the PT source `[toolkit candidate]`
+
+**What we hit:** Naive impl of `build_q_variant` would have called
+`convert_dit` again with `quantize_bits=4` — re-downloading the 54 GB
+PT source, re-loading sharded fp32 weights, re-casting to bf16,
+quantizing, and saving. That's ~30 min for q4 + another 30 min for q8.
+
+Better: quantize **from the already-converted bf16 DiT on disk**. The
+DiT module tree is the same, the weight layout is the same, the
+parameter names are the same. Just:
+
+```python
+model = LongCatVideoTransformer3DModel.from_config(bf16_dit_cfg)
+for shard in bf16_shards:
+    model.load_weights(str(shard), strict=False)
+nn.quantize(model, bits=bits, class_predicate=...)
+quantized_sd = dict(tree_flatten(model.parameters()))
+save_sharded(quantized_sd, out_dir)
+```
+
+Real impact: q4 + q8 both finished in under a minute. Compare to the
+original bf16 conversion which took ~25 minutes (had to pull 54 GB from
+HF + fp32 → bf16 cast).
+
+**Rule for next port:** When adding quantized variants on top of an
+existing bf16 variant, never re-walk the source PT weights. Build the
+model with the bf16 config, load the bf16 weights, run `nn.quantize`,
+snapshot the resulting parameter tree, save. The recipe-side
+`from_bf16` orchestration is short (~20 lines) and idempotent —
+re-running it is free (skip-done sentinels).
+
+**Skill update target:** add to `weight-conversion.md` as a section on
+"Quantized variants — quantize-from-bf16 pattern." Tagged toolkit-
+candidate because the helper (load bf16 → quantize → save sharded)
+generalizes to every quant variant we ship across all ports.
+
+**Artifact:** `recipes/convert_longcat_video.py::quantize_dit_from_bf16`.
+
+---
+
+## L44. Same `class_predicate` in both the recipe and the runtime loader `[toolkit candidate]`
+
+**What we hit:** Quantization with selective skips needs a predicate
+function used **twice**:
+
+1. **At conversion time:** `nn.quantize(model, class_predicate=predicate)`
+   — only the matched Linears get quantized, the skipped ones stay at bf16.
+2. **At runtime:** before `dit.load_weights(quant_shards)`, you must call
+   `nn.quantize(dit, class_predicate=predicate)` with the SAME predicate
+   so that `QuantizedLinear` modules are installed at exactly the matching
+   paths — otherwise `load_weights` will try to load 4-bit packed tensors
+   into a regular `Linear` and fail (or worse, silently misload).
+
+Both call sites need the same skip_patterns list. We solved this by:
+- Embedding `skip_patterns` in the **published config.json** under
+  `quantization.skip_patterns`
+- The conversion recipe reads its skip list from `DIT_QUANT_SKIP_PATTERNS`
+- The runtime loader reads them from `quant_cfg["skip_patterns"]` with
+  a fallback to the same default list
+
+This way the variant is **self-describing**: anyone who downloads
+`LongCat-Video-q4/` from HF can apply the right predicate just by
+reading `dit/config.json`. No version mismatch between recipe and runtime.
+
+**Rule for next port:** Any quant config that uses selective skips
+must embed the skip patterns in the variant's config.json. The
+predicate function (and its skip list) is part of the model's *contract*
+with consumers — not a recipe implementation detail.
+
+**Skill update target:** add to `weight-conversion.md` and to a new
+`quantization.md` page covering both conversion + runtime sides. Tagged
+toolkit-candidate.
+
+**Artifacts:**
+- `recipes/convert_longcat_video.py::_write_dit_config_with_quant`
+- `recipes/convert_longcat_video.py::_should_quantize_dit_linear`
+- `scripts/_common.py::_apply_quantization_for_load`
+
+---
+
+## L45. Quant variants reuse non-DiT components verbatim `[toolkit candidate]`
+
+**What we hit:** Naive impl would have separately converted VAE, umT5,
+LoRAs, scheduler, tokenizer for each quant variant — each variant's
+output dir gets its own copy of everything. That's 11 GB umT5 × 3
+variants = 33 GB of redundant text encoder shards.
+
+But the VAE, umT5, LoRAs are **not quantized** — they're identical bytes
+in all three variants. Quantizing them would degrade output more than
+save space (rule of thumb: only quantize components > ~5 GB; below that
+the absolute disk savings don't justify the quality drift).
+
+Just **copy from bf16** in the q-variant build:
+
+```python
+import shutil
+shutil.copytree(bf16_dir / "vae", q_dir / "vae")
+shutil.copytree(bf16_dir / "text_encoder", q_dir / "text_encoder")
+shutil.copytree(bf16_dir / "lora", q_dir / "lora")
+```
+
+(HF stores these as deduplicated content-addressable blobs server-side
+anyway, so the upload cost is just the q-variant DiT.)
+
+**Rule for next port:** When shipping multiple quant variants of the
+same model, only quantize the components big enough to matter
+(typically > 5 GB) and copy the rest verbatim. The smaller components
+are sensitive — quantizing them often degrades output quality more
+than the marginal disk savings justify.
+
+**Skill update target:** add to `weight-conversion.md` under quant
+variants. Tagged toolkit-candidate because the
+"DiT-only-quant, copy-everything-else" pattern is the dominant shape
+for diffusion model quant variants.
+
+**Artifact:** `recipes/convert_longcat_video.py::build_q_variant`.
+
+---
+
+## L46. HF upload exit isn't atomic with upload completion
+
+**What we hit:** The publish script wraps `subprocess.run(["hf", "upload",
+...], check=True)` which blocks until the subprocess returns. When it
+returned for q8, the log only showed "Finished hashing 22 files" — no
+"Done." final line. Checking HF API immediately showed 1 file
+(.gitattributes), 0 bytes — looked like the upload silently failed.
+
+After a delay (probably async commit settling on HF's backend), the same
+log file gained a final commit-URL line: `url=https://huggingface.co/.../
+commit/87131df...`. The upload had completed, just hadn't flushed the
+final lines to stdout yet — Python's subprocess pipe buffering.
+
+So the apparent "publish failure → 1 file on HF" was actually:
+- `hf upload` HAD finished
+- The commit HAD landed
+- The script's final `print("Done.")` had executed
+- ... but Python's output buffer hadn't been flushed before the harness
+  considered the task complete
+- Polling HF API right after the task completion still showed the
+  pre-commit state (stale)
+
+After ~30s the HF API caught up and reported the full state.
+
+**Rule for next port:** Don't trust `hf models info` polled
+immediately after an upload completes. Either:
+- Sleep 30+ seconds before the verification poll
+- Or read the publish script's commit URL from the log as the
+  ground-truth signal (it's flushed before the script's final print)
+- Or just trust the script's exit code and accept that HF API
+  consistency takes a few seconds to settle
+
+**Skill update target:** add a paragraph to `publish.md` under
+"Verification" — the polling pattern that actually works.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -815,7 +971,7 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L42):**
+**Added in this port (L23–L46):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
@@ -826,5 +982,10 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L40 (partial): Loader-vs-consumer separation for delta-then-discard
 - **L42: Branch parity — every branch must apply every normalization**
   (the stub-DiT-receives-correct-ndim regression test pattern)
+- **L43: Quantize from already-converted bf16, don't re-walk PT source**
+- **L44: Same `class_predicate` in both recipe and runtime loader**
+  (embed `skip_patterns` in published config.json — self-describing)
+- **L45: Quant variants reuse non-DiT components verbatim** (only
+  quantize what's > 5 GB; copy VAE / umT5 / LoRAs)
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.

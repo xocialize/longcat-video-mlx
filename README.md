@@ -4,15 +4,27 @@ Apple MLX port of [LongCat-Video](https://github.com/meituan-longcat/LongCat-Vid
 Meituan's 13.6 B-parameter video diffusion model — for inference on Apple
 Silicon (M-series).
 
-> **Status: alpha — bf16 weights published.** Converted bf16 weights live
-> at [mlx-community/LongCat-Video-bf16](https://huggingface.co/mlx-community/LongCat-Video-bf16)
-> (42 GB). Part of the [LongCat-Video — MLX](https://huggingface.co/collections/mlx-community/longcat-video-mlx-6a216a3576c098e83c1cc167)
-> collection. End-to-end T2V inference verified on real weights;
-> refinement (720p) + LoRA merge wiring remaining for a polished release.
+> **Status: alpha — bf16 + q4 + q8 all published.** Three variants live
+> on HF; pick by RAM budget. Part of the
+> [LongCat-Video — MLX](https://huggingface.co/collections/mlx-community/longcat-video-mlx-6a216a3576c098e83c1cc167) collection.
+> End-to-end T2V verified on all three; refinement (720p) ships but the
+> end-to-end refinement golden + BSA Tier B Metal kernel remain.
 >
 > Companion repo [xocialize/longcat-avatar-mlx](https://github.com/xocialize/longcat-avatar-mlx)
 > ports the Avatar 1.5 variant of the same architecture — start there
 > if you want audio-driven video generation.
+
+## Three variants — pick by RAM budget
+
+| Variant | DiT size | Total disk | Min RAM | Quality | HF |
+|---|---|---|---|---|---|
+| [**bf16**](https://huggingface.co/mlx-community/LongCat-Video-bf16) | 26 GB | 42 GB | 64 GB | reference | ✅ |
+| [**q8**](https://huggingface.co/mlx-community/LongCat-Video-q8) | 15 GB | 31 GB | 48 GB | very close to bf16 | ✅ |
+| [**q4**](https://huggingface.co/mlx-community/LongCat-Video-q4) | 9 GB | 25 GB | 32 GB | minor degradation | ✅ |
+
+CLIs accept `--variant {auto, bf16, q4, q8}`. Default is `auto` — picks
+bf16 if available, falls back to q8 then q4. Just download whichever
+variant fits your Mac.
 
 ## Six task variants, one DiT checkpoint
 
@@ -22,8 +34,8 @@ Silicon (M-series).
 | **I2V** — image-to-video | `pipeline_i2v` | ✅ shipped (B2.1) |
 | **Video Continuation** | `pipeline_continuation` | ✅ shipped (B2.2) |
 | **720p / 30fps refinement** | `refinement.py` (+ BSA) | ✅ shipped (B3.1 + B3.2 Tier A) |
-| **Long-Video** (chained continuation) | `pipeline_long_video` | Pending (B5.1) |
-| **Interactive Video** (per-segment prompts) | `pipeline_interactive` | Pending (B5.2) |
+| **Long-Video** (chained continuation) | `pipeline_long_video` | ✅ shipped (B5.1) |
+| **Interactive Video** (per-segment prompts) | `pipeline_interactive` | ✅ shipped (B5.2) |
 | Streamlit UI | — | Out of scope (use CLI) |
 
 All six are driven by the same 13.6B DiT with optional LoRAs:
