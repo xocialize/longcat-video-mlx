@@ -61,6 +61,7 @@ __all__ = [
     "bsa_attention_metal",
     "bsa_attention_metal_v2",
     "bsa_attention_metal_v3",
+    "bsa_attention_metal_v4",
     "prewarm_metal_kernel",
 ]
 
@@ -68,6 +69,7 @@ __all__ = [
 _KERNEL_CACHE: dict[tuple, object] = {}
 _KERNEL_V2_CACHE: dict[tuple, object] = {}
 _KERNEL_V3_CACHE: dict[tuple, object] = {}
+_KERNEL_V4_CACHE: dict[tuple, object] = {}
 
 
 _BSA_KERNEL_BODY = r"""
@@ -787,6 +789,242 @@ def bsa_attention_metal_v3(
         block_indices = block_indices.astype(mx.int32)
 
     # Dispatch: one threadgroup per Q block, 256 threads per threadgroup
+    num_q_blocks = S // BS
+    grid = (B * H * num_q_blocks * 256, 1, 1)
+    threadgroup = (256, 1, 1)
+
+    out_bm = kernel(
+        inputs=[q_bm, k_bm, v_bm, block_indices],
+        template=[
+            ("T", q.dtype),
+            ("D", D),
+            ("BS", BS),
+            ("TK", TK),
+        ],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(B, H, S, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+
+    return _reshape_from_block_major(out_bm, shape, chunk_thw)
+
+
+# ===========================================================================
+# Phase 4 — simdgroup_matrix HW-accelerated Q × K^T (EXPERIMENTAL)
+# ===========================================================================
+#
+# Phase 3 used scalar dot products + simd_sum for the Q × K^T scores.
+# Phase 4 replaces those with `simdgroup_matrix<fp16, 8, 8>` HW matmul.
+# Per simdgroup, per K-chunk of 8 K tokens, per D-chunk of 8: ONE
+# simdgroup_matrix multiply-accumulate computes an 8×8 score sub-block.
+#
+# Each simdgroup_multiply is ~1 cycle on Apple Silicon tensor cores
+# (vs simd_sum's ~5 cycles for the reduction).
+#
+# Trade-off: Q + K both in shared (32 KB total). V is read globally
+# (lost the V-sharing of Phase 3). Bet: the simdgroup_matrix win on
+# Q × K^T outweighs the V global-read cost.
+
+_BSA_KERNEL_V4_HEADER = """
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+"""
+
+_BSA_KERNEL_V4_BODY = r"""
+    using namespace metal;
+
+    constexpr uint BD = 32;
+    constexpr uint NSG = 8;
+    constexpr uint QPSG = BS / NSG;
+    constexpr uint QK_PT = D / BD;
+    constexpr uint TG_SIZE = NSG * BD;
+    constexpr uint Q_TILE_ELEMS = BS * D;
+    constexpr uint K_CHUNK = 8;
+    constexpr uint D_CHUNK = 8;
+    constexpr uint K_HALF = 32;             // K tile size for streaming
+    constexpr uint K_HALF_ELEMS = K_HALF * D;  // 8 KB for D=128, fp16
+    constexpr uint NUM_K_HALVES = BS / K_HALF; // 2 halves per KV block
+
+    uint tg_lid = thread_position_in_threadgroup.x;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint linear_tg = threadgroup_position_in_grid.x;
+
+    uint S = q_shape[2];
+    uint H = q_shape[1];
+    uint B = q_shape[0];
+    uint num_q_blocks = S / BS;
+
+    uint b = linear_tg / (H * num_q_blocks);
+    uint hq = linear_tg % (H * num_q_blocks);
+    uint h = hq / num_q_blocks;
+    uint q_block = hq % num_q_blocks;
+
+    float max_score[QPSG];
+    float sum_score[QPSG];
+    float o_reg[QPSG][QK_PT];
+    for (uint i = 0; i < QPSG; i++) {
+        max_score[i] = -INFINITY;
+        sum_score[i] = 0.0f;
+        for (uint d = 0; d < QK_PT; d++) o_reg[i][d] = 0.0f;
+    }
+
+    const float scale = 1.0f / sqrt((float)D);
+    const float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+
+    // Shared mem budget for D=128 fp16:
+    //   Q_smem        16 KB (64 Q tokens × 128 × fp16)
+    //   K_smem         8 KB (32 K tokens × 128 × fp16, streamed in halves)
+    //   S_scratch      1 KB (8 simdgroups × 8×8 fp16 score blocks)
+    //   Total         25 KB — fits inside 32 KB M-series limit
+    threadgroup T Q_smem[Q_TILE_ELEMS];
+    threadgroup T K_smem[K_HALF_ELEMS];
+    threadgroup T S_scratch[NSG * K_CHUNK * K_CHUNK];
+
+    uint q_block_base = ((b * H + h) * S + q_block * BS) * D;
+    for (uint e = tg_lid; e < Q_TILE_ELEMS; e += TG_SIZE) {
+        Q_smem[e] = q[q_block_base + e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint bi_base = ((b * H + h) * num_q_blocks + q_block) * TK;
+    for (uint sel = 0; sel < TK; sel++) {
+        int kv_block_idx = block_indices[bi_base + sel];
+        uint kv_token_base = (uint)kv_block_idx * BS;
+
+        threadgroup T* q_base_smem = Q_smem + simd_gid * QPSG * D;
+        threadgroup T* s_scratch_base = S_scratch + simd_gid * K_CHUNK * K_CHUNK;
+
+        // Stream K block in halves to keep K_smem at 8 KB
+        for (uint k_half = 0; k_half < NUM_K_HALVES; k_half++) {
+            uint k_half_start = k_half * K_HALF;   // 0 or 32
+            uint k_half_global = ((b * H + h) * S
+                                  + kv_token_base + k_half_start) * D;
+
+            // Cooperatively load K_HALF=32 K tokens × D = 8 KB
+            for (uint e = tg_lid; e < K_HALF_ELEMS; e += TG_SIZE) {
+                K_smem[e] = k[k_half_global + e];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k_chunk = 0; k_chunk < K_HALF; k_chunk += K_CHUNK) {
+            // Compute 8x8 score block via simdgroup_matrix accumulator
+            simdgroup_matrix<T, K_CHUNK, K_CHUNK> S_smg(0);
+            for (uint d_chunk = 0; d_chunk < D; d_chunk += D_CHUNK) {
+                simdgroup_matrix<T, K_CHUNK, K_CHUNK> Q_tile;
+                simdgroup_matrix<T, K_CHUNK, K_CHUNK> K_tile;
+                simdgroup_load(Q_tile, q_base_smem + d_chunk, D);
+                // Transpose=true: load K[k_chunk:+8, d_chunk:+8] as 8 D-rows x 8 K-cols
+                simdgroup_load(K_tile,
+                               K_smem + k_chunk * D + d_chunk,
+                               D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(S_smg, Q_tile, K_tile, S_smg);
+            }
+            simdgroup_store(S_smg, s_scratch_base, K_CHUNK);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint i = 0; i < QPSG; i++) {
+                for (uint k_col = 0; k_col < K_CHUNK; k_col++) {
+                    float score = (float)s_scratch_base[i * K_CHUNK + k_col]
+                                  * scale_log2;
+
+                    float m_new = max(max_score[i], score);
+                    float exp_diff = fast::exp2(max_score[i] - m_new);
+                    float exp_score = fast::exp2(score - m_new);
+                    sum_score[i] = sum_score[i] * exp_diff + exp_score;
+
+                    uint v_idx = kv_token_base + k_half_start + k_chunk + k_col;
+                    uint v_base = ((b * H + h) * S + v_idx) * D;
+                    for (uint d = 0; d < QK_PT; d++) {
+                        float v_val = (float)v[v_base + simd_lid * QK_PT + d];
+                        o_reg[i][d] = o_reg[i][d] * exp_diff + exp_score * v_val;
+                    }
+                    max_score[i] = m_new;
+                }
+            }
+        }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }  // close k_half loop
+    }
+
+    for (uint i = 0; i < QPSG; i++) {
+        uint q_token_local = simd_gid * QPSG + i;
+        uint q_global = q_block * BS + q_token_local;
+        if (q_global >= S) continue;
+        float inv_l = (sum_score[i] > 0.0f) ? (1.0f / sum_score[i]) : 0.0f;
+        uint out_base = ((b * H + h) * S + q_global) * D;
+        for (uint d = 0; d < QK_PT; d++) {
+            out[out_base + simd_lid * QK_PT + d] = (T)(o_reg[i][d] * inv_l);
+        }
+    }
+"""
+
+
+def _get_kernel_v4(D: int, BS: int, TK: int, dtype: mx.Dtype):
+    """JIT-compile the Phase 4 kernel (cached). Requires fp16 inputs."""
+    if dtype != mx.float16:
+        raise ValueError(
+            f"Phase 4 requires fp16 (simdgroup_matrix is fp16-native). "
+            f"Got dtype={dtype}."
+        )
+    key = (D, BS, TK, dtype)
+    if key not in _KERNEL_V4_CACHE:
+        _KERNEL_V4_CACHE[key] = mx.fast.metal_kernel(
+            name=f"bsa_phase4_D{D}_BS{BS}_TK{TK}",
+            input_names=["q", "k", "v", "block_indices"],
+            output_names=["out"],
+            source=_BSA_KERNEL_V4_BODY,
+            header=_BSA_KERNEL_V4_HEADER,
+            ensure_row_contiguous=True,
+        )
+    return _KERNEL_V4_CACHE[key]
+
+
+def bsa_attention_metal_v4(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    block_indices: mx.array,
+    chunk_thw: tuple[int, int, int] = (4, 4, 4),
+    shape: Optional[tuple[int, int, int]] = None,
+) -> mx.array:
+    """BSA Tier B Phase 4 — `simdgroup_matrix` HW Q × K^T (experimental).
+
+    Constraints:
+    - **fp16 only** (simdgroup_matrix is fp16-native on Apple Silicon)
+    - **D must be a multiple of 32** (simdgroup width + 8 tile)
+    - **BS=64** (the 8 simdgroups × 8 Q math)
+
+    See Phase 3 for the runtime contract; Phase 4 differs only in using
+    HW matmul tiles for the Q × K^T score computation.
+    """
+    if shape is None:
+        raise ValueError("shape=(T_lat, H_lat, W_lat) is required")
+    if q.dtype != mx.float16:
+        raise ValueError(f"Phase 4 requires fp16; got {q.dtype}.")
+
+    B, H, S, D = q.shape
+    BS = chunk_thw[0] * chunk_thw[1] * chunk_thw[2]
+    TK = int(block_indices.shape[-1])
+
+    if S % BS != 0:
+        raise ValueError(f"S={S} must be a multiple of block_size={BS}.")
+    if BS != 64:
+        raise ValueError(f"Phase 4 currently requires block_size=64 (got {BS}).")
+    if D % 32 != 0:
+        raise ValueError(f"head_dim D={D} must be a multiple of 32.")
+
+    q_bm = _reshape_to_block_major(q, shape, chunk_thw)
+    k_bm = _reshape_to_block_major(k, shape, chunk_thw)
+    v_bm = _reshape_to_block_major(v, shape, chunk_thw)
+
+    kernel = _get_kernel_v4(D, BS, TK, q.dtype)
+
+    if block_indices.dtype != mx.int32:
+        block_indices = block_indices.astype(mx.int32)
+
     num_q_blocks = S // BS
     grid = (B * H * num_q_blocks * 256, 1, 1)
     threadgroup = (256, 1, 1)

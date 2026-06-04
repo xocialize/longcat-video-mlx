@@ -1399,6 +1399,127 @@ attention.py`.
 
 ---
 
+## L57. `simdgroup_matrix` works in `mx.fast.metal_kernel` JIT — verify via toy first `[toolkit candidate]`
+
+**What we hit:** Phase 4 BSA needed `simdgroup_matrix<fp16, 8, 8>` HW
+matmul to push past Phase 3. Unclear whether MLX's JIT supports it —
+MLX's production attention uses `simdgroup_matrix` through the
+heavyweight `steel/attn/mma.h` template machinery that JIT can't pull in.
+
+Verified by writing a 30-line toy kernel (8×8 fp16 matmul) BEFORE any
+real Phase 4 work:
+
+```python
+HEADER = """
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+"""
+SOURCE = """
+    simdgroup_matrix<half, 8, 8> A, B, C;
+    simdgroup_load(A, a, 8);
+    simdgroup_load(B, b, 8);
+    simdgroup_multiply(C, A, B);
+    simdgroup_store(C, out, 8);
+"""
+mx.fast.metal_kernel(source=SOURCE, header=HEADER, ...)
+```
+
+It compiled cleanly, dispatched, produced a correct matmul. **The
+feature is JIT-available.**
+
+**Rule for next port:** Before designing any custom Metal kernel that
+needs HW matmul (or any other simdgroup primitive), write a 30-line
+toy kernel using the proposed feature inside `mx.fast.metal_kernel`.
+If it compiles, the feature is JIT-available. If it errors, find an
+alternative pattern BEFORE the bigger design.
+
+`mx.fast.metal_kernel` accepts arbitrary Metal Shading Language source
+including `<metal_simdgroup>` and `<metal_simdgroup_matrix>` via the
+`header=` argument. The full Apple GPU instruction surface is exposed
+to JIT — including HW tensor matmul.
+
+**Skill update target:** add to `custom-metal-kernels.md` as the
+canonical "verify JIT feature availability via toy kernel" first-step
+pattern. Tagged toolkit-candidate.
+
+**Artifact:** `/tmp/toy_simdgroup_matrix.py` (preserved as template).
+
+---
+
+## L58. Metal `simdgroup_multiply_accumulate` is 4-arg (`d = a*b + c`), not 3-arg
+
+**What we hit:** First Phase 4 compile attempt failed with:
+
+```
+candidate function requires 4 arguments, but 3 were provided
+simdgroup_multiply_accumulate(d, a, b, c)
+```
+
+Metal's `simdgroup_multiply_accumulate` is fully explicit: **`d = a*b + c`**
+where `c` is a SEPARATE accumulator input, NOT implicit. For C += A*B,
+pass C as both output AND 4th-arg input:
+
+```cpp
+simdgroup_multiply_accumulate(S_smg, Q_tile, K_tile, S_smg);
+```
+
+Different from CUDA's `__mma_sync` and many other matmul APIs where
+the accumulator is implicit. Also note: Metal's template param order
+is **`<T, ColumnCount, RowCount>`** — backwards from typical math
+notation `<T, Rows, Cols>`. For square 8×8 it doesn't matter; for
+asymmetric tiles, get it right.
+
+**Rule for next port:** When using `simdgroup_multiply_accumulate`,
+always pass the accumulator as BOTH the destination AND the 4th
+input: `simdgroup_multiply_accumulate(C, A, B, C)`.
+
+**Skill update target:** add to `custom-metal-kernels.md` under
+"simdgroup_matrix API surface."
+
+---
+
+## L59. Apple Silicon M-series threadgroup memory is a HARD 32 KB limit — plan streaming `[toolkit candidate]`
+
+**What we hit:** Phase 4 BSA at production D=128 needed
+Q_smem (16 KB) + K_smem (16 KB, full 64 K tokens) + S_scratch (1 KB) =
+**33,792 bytes**. Driver errored at kernel-load time:
+
+```
+Threadgroup memory size (33792) exceeds the maximum threadgroup memory
+allowed (32768)
+```
+
+The 32 KB limit is **enforced by the driver at kernel-launch** on
+M-series M1/M2. NOT a soft "may be slow" — the kernel won't load.
+M3+ allows 64 KB.
+
+Workaround: **stream K in halves**. Load 32 K tokens at a time
+(8 KB) instead of all 64. Outer loop over K halves (2 iterations per
+KV block), inner loop unchanged. Phase 4 D=128 with K-streaming
+shipped at 1.5-1.6× over Phase 3 (2.0-2.55× over dense at S=8K-12.8K).
+
+**Rule for next port:** Before writing the kernel, ENUMERATE every
+`threadgroup` array's byte cost. Sum > 32 KB on M1/M2 (64 KB on
+M3+) → choose:
+
+1. **Streaming** — load tiles in halves/quarters; more iterations,
+   more cooperative loads, but math unchanged
+2. **Drop a tile** — e.g., V global instead of shared; lose some
+   bandwidth amortization
+3. **Smaller intermediate widths** — e.g., fp16 instead of fp32
+   accumulators in shared
+
+Streaming is usually the cleanest answer because correctness is
+unchanged.
+
+**Skill update target:** add a "Threadgroup memory budget" table to
+`custom-metal-kernels.md` with M1/M2/M3+ limits and streaming patterns.
+Tagged toolkit-candidate — EVERY non-trivial Metal kernel hits this.
+
+**Artifact:** `bsa-tier-b-design.md` Phase 4 K-streaming section.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -1414,7 +1535,7 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L56):**
+**Added in this port (L23–L59):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
@@ -1455,5 +1576,12 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - **L56: Auto-select kernel by sequence length at the dispatcher
   boundary** — expose all variants explicitly, provide auto-selecting
   default, use measured (not theoretical) crossover
+- **L57: `simdgroup_matrix` works in `mx.fast.metal_kernel` JIT** —
+  verify via 30-line toy kernel BEFORE any major design work. HW matmul
+  via `<metal_simdgroup_matrix>` is fully JIT-available
+- L58: Metal `simdgroup_multiply_accumulate` is 4-arg (`d = a*b + c`)
+  — pass accumulator as both output and 4th input
+- **L59: 32 KB threadgroup memory is a HARD M-series limit** — plan
+  streaming (split K block in halves) when sum > 32 KB on M1/M2
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.

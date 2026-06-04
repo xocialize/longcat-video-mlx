@@ -89,7 +89,7 @@ class Attention(nn.Module):
         if self.enable_bsa and shape is not None and q.shape[-2] == k.shape[-2]:
             # Pure self-attention with aligned Q/K — BSA-safe.
             try:
-                if self.bsa_backend in ("metal", "metal_v2", "metal_v3"):
+                if self.bsa_backend in ("metal", "metal_v2", "metal_v3", "metal_v4"):
                     # Tier B Metal path — compute routing in MLX, then
                     # dispatch the appropriate kernel.
                     from longcat_video.models.block_sparse_attention import (
@@ -98,6 +98,7 @@ class Attention(nn.Module):
                     )
                     from longcat_video.models.block_sparse_attention_metal import (
                         bsa_attention_metal_v2, bsa_attention_metal_v3,
+                        bsa_attention_metal_v4,
                     )
                     q_blocks = mean_pool_blocks_3d(q, shape, self.bsa_chunk_thw)
                     k_blocks = mean_pool_blocks_3d(k, shape, self.bsa_chunk_thw)
@@ -109,28 +110,52 @@ class Attention(nn.Module):
                     # Choose kernel:
                     # - "metal_v2" → explicit Phase 2 (simdgroup-cooperative)
                     # - "metal_v3" → explicit Phase 3 (threadgroup-shared K+V)
-                    # - "metal" → AUTO-SELECT based on seq length. Phase 3
-                    #   wins above ~1280; below that Phase 2's lower
-                    #   per-threadgroup overhead is faster.
+                    # - "metal_v4" → explicit Phase 4 (simdgroup_matrix HW matmul)
+                    # - "metal" → AUTO-SELECT — Phase 4 > Phase 3 > Phase 2
+                    #   based on constraints + sequence length.
                     S = int(q.shape[-2])
-                    if self.bsa_backend == "metal_v2":
-                        use_v3 = False
-                    elif self.bsa_backend == "metal_v3":
-                        use_v3 = True
-                    else:  # "metal" auto
-                        # Phase 3 requires block_size=64 + D%32==0 + 32 KB
-                        # threadgroup memory budget. We crossover at S≈1280.
-                        BS_pred = (self.bsa_chunk_thw[0]
-                                   * self.bsa_chunk_thw[1]
-                                   * self.bsa_chunk_thw[2])
-                        D_pred = int(q.shape[-1])
-                        dtype_size = 2 if q.dtype in (mx.float16, mx.bfloat16) else 4
-                        tg_mem = 2 * BS_pred * D_pred * dtype_size
-                        use_v3 = (S >= 1280 and BS_pred == 64
-                                  and D_pred % 32 == 0
-                                  and tg_mem <= 32 * 1024)
+                    BS_pred = (self.bsa_chunk_thw[0]
+                               * self.bsa_chunk_thw[1]
+                               * self.bsa_chunk_thw[2])
+                    D_pred = int(q.shape[-1])
 
-                    if use_v3:
+                    if self.bsa_backend == "metal_v2":
+                        backend_choice = "v2"
+                    elif self.bsa_backend == "metal_v3":
+                        backend_choice = "v3"
+                    elif self.bsa_backend == "metal_v4":
+                        backend_choice = "v4"
+                    else:  # "metal" auto
+                        # Phase 4 requires fp16 + BS=64 + D%32==0
+                        v4_ok = (
+                            q.dtype == mx.float16
+                            and BS_pred == 64
+                            and D_pred % 32 == 0
+                            and S >= 1280
+                        )
+                        # Phase 3 needs BS=64 + D%32==0 + K+V fit 32 KB
+                        dtype_size = (
+                            2 if q.dtype in (mx.float16, mx.bfloat16) else 4
+                        )
+                        v3_ok = (
+                            S >= 1280
+                            and BS_pred == 64
+                            and D_pred % 32 == 0
+                            and 2 * BS_pred * D_pred * dtype_size <= 32 * 1024
+                        )
+                        if v4_ok:
+                            backend_choice = "v4"
+                        elif v3_ok:
+                            backend_choice = "v3"
+                        else:
+                            backend_choice = "v2"
+
+                    if backend_choice == "v4":
+                        return bsa_attention_metal_v4(
+                            q, k, v, block_indices,
+                            chunk_thw=self.bsa_chunk_thw, shape=shape,
+                        )
+                    if backend_choice == "v3":
                         return bsa_attention_metal_v3(
                             q, k, v, block_indices,
                             chunk_thw=self.bsa_chunk_thw, shape=shape,

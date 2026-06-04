@@ -285,6 +285,54 @@ At actual 720p refinement attention shapes (T_lat=8, H_lat=90, W_lat=160
 3. ~13× theoretical FLOPs reduction — capped by bandwidth, so we'll see
    3-5× actual wall-clock improvement (vs 2-2.3× at S=12.8K)
 
+## Phase 4 results (B4.1 P4) — SHIPPED ✅
+
+**Built it. It works. It's 2.55× faster than dense at S=12.8K.**
+
+Phase 4 replaces Phase 3's scalar Q × K^T dot products with
+`simdgroup_matrix<fp16, 8, 8>` HW-accelerated matmul tiles. Per
+simdgroup, per K-chunk of 8 K tokens, per D-chunk of 8: ONE
+`simdgroup_multiply_accumulate` computes an 8×8 score sub-block.
+
+### Threadgroup memory constraint (L59)
+
+Phase 4 design at D=128 needed Q (16 KB) + K (16 KB) + scratch (1 KB) =
+33 KB, exceeding Apple Silicon's hard 32 KB limit. Workaround: **stream
+K in halves** — load 32 K tokens at a time (8 KB), outer loop over K
+halves. Budget at D=128: Q (16 KB) + K_half (8 KB) + S_scratch (1 KB)
+= 25 KB. Fits.
+
+### Performance (fp16, sparsity=0.9375, D=128)
+
+| shape | dense | P3 | **P4** | P4 vs dense | P4 vs P3 |
+|---|---|---|---|---|---|
+| S=2048 | 2.73 | 2.65 | **2.29** | **1.19×** | 1.16× |
+| S=3840 | 8.48 | 6.41 | **5.34** | **1.59×** | 1.20× |
+| S=8192 | 31.75 | 23.98 | **16.03** | **1.98×** | **1.50×** |
+| S=12800 | 65.33 | 41.10 | **25.64** | **2.55×** | **1.60×** |
+
+Phase 4 wins at every shape; the gap grows with sequence length. The
+HW matmul (simdgroup_multiply_accumulate ~1 cycle) beats P3's scalar
+fp32 multiplies + simd_sum reductions (~5 cycles per reduction).
+
+### Performance at smaller D (fp16, D=64)
+
+| shape | dense | P3 | **P4** | P4 vs P3 |
+|---|---|---|---|---|
+| S=12800 | 27.02 | 33.00 | **16.89** | **1.95×** |
+
+At D=64, Q + K both fit without streaming (16 KB total), so the kernel
+runs without the K-streaming overhead.
+
+### Key lessons captured
+
+- **L57**: simdgroup_matrix WORKS in mx.fast.metal_kernel JIT — verified
+  via 30-line toy kernel BEFORE major design work
+- **L58**: `simdgroup_multiply_accumulate` is 4-arg (d = a*b + c) — pass
+  accumulator as BOTH output AND 4th input
+- **L59**: 32 KB threadgroup memory is a HARD M-series limit — design
+  with streaming if Q + K + scratch > 32 KB
+
 ## Phase 3 design notes (potential future work)
 
 To push beyond 1.35×, the next optimization would be:
