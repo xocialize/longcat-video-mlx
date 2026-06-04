@@ -223,12 +223,15 @@ class LongCatVideoTransformer3DModel(nn.Module):
         Args:
             backend: BSA implementation to use:
                 - "tier_a"   — pure-MLX reference (default; safest fallback)
-                - "metal"    — auto-selecting Metal kernel: Phase 3
-                  (threadgroup-shared K+V) at S≥1280 where block_size=64
-                  and D%32==0 and shared-mem fits 32 KB; Phase 2 otherwise.
+                - "metal"    — auto-selecting Metal kernel:
+                  Phase 4 (simdgroup_matrix HW matmul) when fp16 +
+                  BS=64 + D%32==0 + S≥1280; otherwise Phase 3
+                  (threadgroup-shared K+V) when constraints fit;
+                  otherwise Phase 2 (simdgroup-cooperative).
                   Best wall-clock at production refinement shapes.
                 - "metal_v2" — explicit Phase 2 (simdgroup-cooperative)
                 - "metal_v3" — explicit Phase 3 (threadgroup-shared K+V)
+                - "metal_v4" — explicit Phase 4 (simdgroup_matrix HW matmul)
 
         Used by the refinement pipeline before the 720p denoise loop.
         BSA params are read from the published config's `bsa_params`
@@ -243,7 +246,7 @@ class LongCatVideoTransformer3DModel(nn.Module):
         | S=8192 | 38.5 ms | 34.3 ms | **17.2 ms** (2.23× dense) |
         | S=12800 | 75.3 ms | 63.5 ms | **36.2 ms** (2.08× dense) |
         """
-        valid = ("tier_a", "metal", "metal_v2", "metal_v3")
+        valid = ("tier_a", "metal", "metal_v2", "metal_v3", "metal_v4")
         assert backend in valid, (
             f"unknown BSA backend: {backend!r}. Choose from {valid}"
         )

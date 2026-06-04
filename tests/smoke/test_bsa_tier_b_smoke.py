@@ -28,13 +28,14 @@ def _import_smoke():
         bsa_attention_metal,
         bsa_attention_metal_v2,
         bsa_attention_metal_v3,
+        bsa_attention_metal_v4,
         prewarm_metal_kernel,
     )
     return (
         bsa_attention, bsa_attention_metal,
         topk_block_indices, block_routing_scores, mean_pool_blocks_3d,
         prewarm_metal_kernel, bsa_attention_metal_v2,
-        bsa_attention_metal_v3,
+        bsa_attention_metal_v3, bsa_attention_metal_v4,
     )
 
 
@@ -121,7 +122,7 @@ def test_metal_kernel_partial_sparsity_matches_tier_a():
     kernel output must match Tier A's pure-MLX path within fp32 noise.
     Both consume the SAME `block_indices`, so the only difference is the
     computational path (kernel vs masked dense SDPA)."""
-    bsa_a, bsa_metal, topk, scores_fn, mean_pool, _, _, _ = _import_smoke()
+    bsa_a, bsa_metal, topk, scores_fn, mean_pool, _, _, _, _ = _import_smoke()
 
     # 8×8×8 latent = 2×2×2 = 8 blocks of 64 tokens
     T, H_lat, W_lat = 8, 8, 8
@@ -176,7 +177,7 @@ def test_metal_kernel_rejects_misaligned_S():
 
 def test_prewarm_runs_without_error():
     """Prewarm should JIT-compile cached kernels without crashing."""
-    bsa_a, bsa_metal, topk, scores_fn, mean_pool, prewarm, _, _ = _import_smoke()
+    bsa_a, bsa_metal, topk, scores_fn, mean_pool, prewarm, _, _, _ = _import_smoke()
     prewarm(head_dim=16, block_size=64, top_k_values=(1,), dtype=mx.float32)
 
 
@@ -185,7 +186,7 @@ def test_prewarm_runs_without_error():
 def test_phase2_degenerate_case_matches_dense_fp32():
     """Phase 2 + sparsity=0 ≡ dense SDPA. Same gate as Phase 1, but for
     the simdgroup-cooperative kernel."""
-    *_, bsa_v2, _ = _import_smoke()
+    *_, bsa_v2, _, _ = _import_smoke()
 
     # D must be a multiple of 32 for Phase 2
     T, H_lat, W_lat = 4, 4, 4
@@ -218,7 +219,7 @@ def test_phase2_matches_phase1():
     online-softmax block-sparse attention with the same routing. They
     differ only in HW utilization (Phase 2 uses simd_sum reduction).
     """
-    _, bsa_p1, *_, bsa_v2, _ = _import_smoke()
+    _, bsa_p1, *_, bsa_v2, _, _ = _import_smoke()
 
     T, H_lat, W_lat = 8, 8, 8
     S = T * H_lat * W_lat
@@ -251,7 +252,7 @@ def test_phase2_matches_phase1():
 def test_phase2_matches_tier_a_partial_sparsity():
     """Phase 2 with routed block_indices should match Tier A pure-MLX
     output within fp32 noise."""
-    bsa_a, _, topk, scores_fn, mean_pool, _, bsa_v2, _ = _import_smoke()
+    bsa_a, _, topk, scores_fn, mean_pool, _, bsa_v2, _, _ = _import_smoke()
 
     T, H_lat, W_lat = 8, 8, 8
     S = T * H_lat * W_lat
@@ -279,7 +280,7 @@ def test_phase2_matches_tier_a_partial_sparsity():
 
 def test_phase2_rejects_non_multiple_of_32_head_dim():
     """Phase 2 requires D % 32 == 0 (the simdgroup width)."""
-    *_, bsa_v2, _ = _import_smoke()
+    *_, bsa_v2, _, _ = _import_smoke()
     q = mx.zeros((1, 1, 64, 24))  # D=24, not a multiple of 32
     k = mx.zeros((1, 1, 64, 24))
     v = mx.zeros((1, 1, 64, 24))
@@ -292,7 +293,7 @@ def test_phase2_rejects_non_multiple_of_32_head_dim():
 
 def test_phase3_degenerate_case_matches_dense_fp32():
     """Phase 3 + sparsity=0 ≡ dense SDPA. The strongest correctness gate."""
-    *_, bsa_v3 = _import_smoke()
+    *_, bsa_v3, _ = _import_smoke()
     T, H_lat, W_lat = 4, 4, 4
     S = T * H_lat * W_lat
     B, num_heads, D = 1, 2, 64
@@ -317,7 +318,7 @@ def test_phase3_bit_identical_to_phase2():
     same dot products, same scale). Output should be **bit-identical**
     modulo any non-deterministic ordering — in practice we observe
     max_abs = 0.0 across many test cases."""
-    _, _, _, _, _, _, bsa_v2, bsa_v3 = _import_smoke()
+    _, _, _, _, _, _, bsa_v2, bsa_v3, _ = _import_smoke()
 
     T, H_lat, W_lat = 8, 8, 8
     S = T * H_lat * W_lat
@@ -347,7 +348,7 @@ def test_phase3_bit_identical_to_phase2():
 
 def test_phase3_matches_tier_a_partial_sparsity():
     """Phase 3 with routed indices should match Tier A within fp32 noise."""
-    bsa_a, _, topk, scores_fn, mean_pool, _, _, bsa_v3 = _import_smoke()
+    bsa_a, _, topk, scores_fn, mean_pool, _, _, bsa_v3, _ = _import_smoke()
     T, H_lat, W_lat = 8, 8, 8
     S = T * H_lat * W_lat
     B, num_heads, D = 1, 4, 64
@@ -373,10 +374,101 @@ def test_phase3_matches_tier_a_partial_sparsity():
 def test_phase3_rejects_oversized_threadgroup_memory():
     """Phase 3 requires K_smem + V_smem ≤ 32 KB. With D=512 fp16 the
     total would be 2 * 64 * 512 * 2 = 64 KB → must raise."""
-    *_, bsa_v3 = _import_smoke()
+    *_, bsa_v3, _ = _import_smoke()
     q = mx.zeros((1, 1, 64, 512), dtype=mx.float16)
     k = mx.zeros((1, 1, 64, 512), dtype=mx.float16)
     v = mx.zeros((1, 1, 64, 512), dtype=mx.float16)
     bi = mx.zeros((1, 1, 1, 1), dtype=mx.int32)
     with pytest.raises(ValueError, match="threadgroup memory"):
         bsa_v3(q, k, v, bi, chunk_thw=(4, 4, 4), shape=(4, 4, 4))
+
+
+# ----- Phase 4 (simdgroup_matrix HW matmul) tests -------------------------
+
+def test_phase4_degenerate_case_matches_dense_fp16():
+    """Phase 4 + sparsity=0 ≡ dense SDPA. Phase 4 is fp16-only because
+    simdgroup_matrix is fp16-native on Apple Silicon."""
+    *_, bsa_v4 = _import_smoke()
+    T, H_lat, W_lat = 4, 4, 4
+    S = T * H_lat * W_lat
+    B, num_heads, D = 1, 2, 128  # D=128 production case (with K-streaming)
+    mx.random.seed(0)
+    q = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    k = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    v = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    mx.eval(q, k, v)
+    out_dense = mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=1.0 / math.sqrt(D),
+    )
+    block_indices = mx.zeros((B, num_heads, 1, 1), dtype=mx.int32)
+    out_p4 = bsa_v4(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    mx.eval(out_dense, out_p4)
+    diff = float(mx.max(mx.abs(out_p4 - out_dense)))
+    # Phase 4 with K-streaming has slightly looser tolerance vs P3 due to
+    # different accumulation order (8 D-chunks per simdgroup_multiply call).
+    assert diff < 1e-2, f"Phase 4 degenerate case: max_abs={diff:.3e}"
+
+
+def test_phase4_works_at_d64_no_k_streaming():
+    """At D=64, Phase 4 fits Q+K_full without needing K-streaming.
+    Verify the same kernel handles both branches correctly."""
+    *_, bsa_v4 = _import_smoke()
+    T, H_lat, W_lat = 4, 4, 4
+    S = T * H_lat * W_lat
+    B, num_heads, D = 1, 2, 64
+    mx.random.seed(0)
+    q = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    k = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    v = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    mx.eval(q, k, v)
+    out_dense = mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=1.0 / math.sqrt(D),
+    )
+    block_indices = mx.zeros((B, num_heads, 1, 1), dtype=mx.int32)
+    out_p4 = bsa_v4(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    mx.eval(out_dense, out_p4)
+    diff = float(mx.max(mx.abs(out_p4 - out_dense)))
+    assert diff < 1e-2, f"Phase 4 D=64: max_abs={diff:.3e}"
+
+
+def test_phase4_matches_phase3_partial_sparsity():
+    """Phase 3 and Phase 4 implement the same math (online softmax over
+    block-routed attention). Output should match within fp16 noise."""
+    _, _, _, _, _, _, _, bsa_v3, bsa_v4 = _import_smoke()
+    T, H_lat, W_lat = 8, 8, 8
+    S = T * H_lat * W_lat
+    B, num_heads, D = 1, 4, 128
+    num_blocks = (T // 4) * (H_lat // 4) * (W_lat // 4)
+
+    mx.random.seed(42)
+    q = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    k = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    v = mx.random.normal((B, num_heads, S, D)).astype(mx.float16)
+    mx.eval(q, k, v)
+
+    block_indices = mx.broadcast_to(
+        mx.arange(3, dtype=mx.int32),
+        (B, num_heads, num_blocks, 3),
+    )
+    out_p3 = bsa_v3(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    out_p4 = bsa_v4(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    mx.eval(out_p3, out_p4)
+    diff = float(mx.max(mx.abs(out_p4 - out_p3)))
+    # P3 uses scalar dot products; P4 uses HW matmul tiles. Same math,
+    # different accumulation order → ~1e-2 tolerance at fp16.
+    assert diff < 1e-2, f"Phase 4 vs Phase 3: max_abs={diff:.3e}"
+
+
+def test_phase4_rejects_non_fp16():
+    """Phase 4 requires fp16 inputs (simdgroup_matrix fp16-native)."""
+    *_, bsa_v4 = _import_smoke()
+    q = mx.zeros((1, 1, 64, 128), dtype=mx.float32)
+    k = mx.zeros((1, 1, 64, 128), dtype=mx.float32)
+    v = mx.zeros((1, 1, 64, 128), dtype=mx.float32)
+    bi = mx.zeros((1, 1, 1, 1), dtype=mx.int32)
+    with pytest.raises(ValueError, match="fp16"):
+        bsa_v4(q, k, v, bi, chunk_thw=(4, 4, 4), shape=(4, 4, 4))
