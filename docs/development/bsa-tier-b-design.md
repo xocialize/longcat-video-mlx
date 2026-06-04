@@ -226,6 +226,65 @@ BSA at small block_size (64) with sparse KV (~6%) is the second case.
 The number of attention pairs per Q block is small (~7K), so the
 overhead of simdgroup_matrix's tile setup outweighs the matmul speedup.
 
+## Phase 3 results (B4.1 P3) — SHIPPED ✅
+
+**Built it. It works. It's 2-2.3× faster than dense at large shapes.**
+
+The design: 1 threadgroup per Q block (64 tokens), 8 simdgroups per
+threadgroup (each handles 8 Q tokens), K + V both cooperatively loaded
+into 32 KB threadgroup shared memory (16 KB each, exactly at the M-series
+limit). Q stays in registers (per-thread distributed).
+
+This eliminates the across-simdgroup K/V global-read redundancy of
+Phase 2 — instead of 8 simdgroups all independently re-reading K/V
+from global, they share one cooperative load per KV block.
+
+**Correctness ✅**: Output is **bit-identical to Phase 2** (max_abs =
+0.0 across all tests). Both implement identical online softmax math
+with identical accumulator order; Phase 3 just caches K/V differently.
+
+**Performance** (fp16, sparsity=0.9375):
+
+| shape | dense | Phase 2 | **Phase 3** | P3 vs dense | P3 vs P2 |
+|---|---|---|---|---|---|
+| S=384 | 0.34 | 0.51 | 0.98 | 0.34× (overhead) | 0.51× |
+| S=2048 | 2.43 | 2.72 | **2.35** | **1.03×** | 1.16× |
+| S=1280 | 1.14 | 2.22 | **1.05** | **1.08×** | 2.11× |
+| S=3840 | 8.01 | 8.82 | **6.10** | **1.31×** | 1.44× |
+| S=8192 | 38.5 | 34.3 | **17.2** | **2.23×** | **1.99×** |
+| S=12800 | 75.3 | 63.5 | **36.2** | **2.08×** | 1.76× |
+
+Phase 3 hits the **2-2.3× faster than dense** target the plan v1
+promised. The win **grows with sequence length** as predicted —
+threadgroup-shared K/V reduces bandwidth pressure that dominates large-S
+attention.
+
+At very small S (384), Phase 3 is slower because of per-threadgroup
+setup overhead. The `enable_bsa(backend="metal")` auto-selector defaults
+to Phase 2 below S=1280 and Phase 3 above.
+
+## Backend integration
+
+`LongCatVideoTransformer3DModel.enable_bsa(backend=...)` accepts:
+
+- `"tier_a"` (default) — pure-MLX reference
+- `"metal"` — auto-select Phase 3 at S≥1280 + constraints, Phase 2 otherwise
+- `"metal_v2"` — explicit Phase 2
+- `"metal_v3"` — explicit Phase 3
+
+`scripts/run_refine.py` honors `LONGCAT_BSA_BACKEND=metal` to opt into
+the auto-selecting Metal path.
+
+## Production scaling estimate
+
+At actual 720p refinement attention shapes (T_lat=8, H_lat=90, W_lat=160
+→ S=115K per head), the win should widen further because:
+
+1. Dense SDPA is O(S²) = 1.3 × 10¹⁰ ops
+2. BSA Phase 3 is O(S × top_k × BS) = 115K × ~130 × 64 ≈ 10⁹ ops
+3. ~13× theoretical FLOPs reduction — capped by bandwidth, so we'll see
+   3-5× actual wall-clock improvement (vs 2-2.3× at S=12.8K)
+
 ## Phase 3 design notes (potential future work)
 
 To push beyond 1.35×, the next optimization would be:
