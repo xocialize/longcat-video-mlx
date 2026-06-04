@@ -20,6 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "mlx>=0.31.0",
+    "mlx-arsenal>=0.10",
     "safetensors>=0.4",
     "huggingface_hub>=0.34",
     "numpy>=1.26",
