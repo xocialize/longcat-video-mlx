@@ -1,0 +1,621 @@
+# Skill lessons — longcat-video-mlx
+
+Continuation of [the Avatar port's skill-lessons](https://github.com/xocialize/longcat-avatar-mlx/blob/main/docs/development/skill-lessons.md).
+Avatar lessons are L1–L22; **this port adds L23+**. When both ports are
+distilled into the `mlx-porting` skill, the numbering merges cleanly.
+
+**`[toolkit candidate]` tag convention:** same as the Avatar repo — marks
+lessons whose artifact (script, helper, template) is a strong candidate for
+extraction into a shared `mlx-port-toolkit` repo once the pattern has
+survived multiple ports. Confirm by surviving at least 3 of the 4
+architecture families (VAE / text encoder / DiT / audio encoder) before
+extracting.
+
+Each entry: short title → what we hit → the rule for next time → skill
+update target.
+
+## How to add a new lesson (read me before appending)
+
+When you discover a non-obvious pattern, gotcha, or technique during this
+port, **add a new `## L{N}` entry here in the same shift you discovered
+it**. Don't wait for "end of port" — the working memory of *why* fades
+fast.
+
+Checklist for a good lesson entry:
+
+1. **Title** is one line. State the rule, not the symptom. ✅ "Publishing
+   config often contains BSA params — read config before source spelunking"
+   ❌ "BSA was hard to find"
+2. **What we hit** — the failure / symptom / specific moment. File:line
+   citation when the lesson is code-shaped.
+3. **Rule for next time** — what a *future port should DO*, in one
+   imperative sentence.
+4. **Skill update target** — which doc in `/mlx-porting` skill this folds
+   into (`common-pitfalls.md`, `repo-layout.md`, `numerics.md`,
+   `weight-conversion.md`, `publish.md`, etc.). If it's a new section,
+   say so.
+5. **`[toolkit candidate]` tag** — only when the artifact is generic
+   enough to recur across multiple ports.
+
+After adding the lesson, mention it in your commit message
+(e.g. `+ L27 (BSA Tier A correctness gate via sparsity=0)`).
+
+---
+
+## L23. Publishing config often contains the implementation details — read it before source-spelunking `[toolkit candidate]`
+
+**What we hit:** Plan v1 flagged the **BSA block configuration** as the #1
+blocker for Tier B (Metal kernel) — chunk size, sparsity, and top-k all
+depend on it. We expected to spend an afternoon source-spelunking
+`block_sparse_attention/bsa_interface.py` to back out the constants. Then
+we opened `dit/config.json` from the published model and:
+
+```json
+"bsa_params": {
+  "sparsity": 0.9375,
+  "chunk_3d_shape_q": [4, 4, 4],
+  "chunk_3d_shape_k": [4, 4, 4]
+},
+"enable_bsa": false,
+```
+
+All three constants were sitting right there. Plan v1 Open Question #1
+was closed by reading one file.
+
+**Rule for next port:** Before opening any modeling source file to back
+out architectural constants, **diff the published config.json against
+the model's `__init__` signature**. Anything in the config that isn't a
+kwarg of `__init__` is a *runtime-mutable* parameter the upstream team
+chose to expose — and these are exactly the constants downstream code
+needs to know about (block shapes, sparsity, dropout schedules, head-dim
+splits, etc).
+
+This shows up at the top of the workflow doc as a Stage-0 task:
+> Snapshot all published `config.json` files. Cross-reference any
+> "magic numbers" the plan flagged as Open Questions against them
+> *before* opening modeling source.
+
+**Skill update target:** new entry in `repo-layout.md` under "Stage 0
+reconnaissance — what to do before code." Tagged toolkit-candidate
+because the diff itself (config-vs-init) is mechanical and reusable.
+
+**Artifact location:** `docs/development/bsa-config-found.md`.
+
+---
+
+## L24. BSA / sparse-attention Tier A correctness gate: `sparsity=0 ≡ dense SDPA` `[toolkit candidate]`
+
+**What we hit:** Block Sparse Attention is a routing-then-attend op:
+mean-pool blocks → top-k routing → mask out non-routed pairs → attend.
+Many places to make off-by-one errors (block index, mask polarity,
+softmax scale, etc.). Wanted a single end-to-end correctness gate before
+spending hours on per-step parity vs PT.
+
+The strongest possible gate is the **degenerate case where routing keeps
+every block** — i.e. `sparsity=0`. In that regime BSA must produce
+**exactly the same output as dense scaled-dot-product attention**:
+
+```python
+out_bsa   = bsa_attention(q, k, v, shape=(T,H,W), sparsity=0.0)
+out_dense = mx.fast.scaled_dot_product_attention(q, k, v, scale=...)
+assert mx.max(mx.abs(out_bsa - out_dense)) < 1e-4
+```
+
+If that holds, **every step of the routing + masking pipeline is
+verified** — because any error (wrong block index, flipped mask polarity,
+missing scale) would diverge on this case. Took the BSA test suite from
+"I think it works" to "verified" in 4 lines.
+
+The drift tolerance is ~1e-4 (not 0) because the additive-0 mask path
+still adds a `0.0` tensor before softmax, which has different rounding
+behavior than the no-mask path.
+
+**Rule for next port:** For any sparse / routed / gated attention port,
+write the degenerate-case test first:
+- Sparse attention with sparsity 0 (or top-k = all blocks) ≡ dense
+- MoE with all experts → expert 0 ≡ that expert's dense forward
+- Linear attention with kernel that reduces to softmax ≡ standard attn
+
+Land that test in smoke before any routing tests. It's the cheapest
+"my whole pipeline is wrong" alarm you'll ever build.
+
+**Skill update target:** new section in `numerics.md` titled "Degenerate-
+case correctness gates for sparse/routed ops." Tagged toolkit-candidate
+because the pattern (find a degenerate setting that reduces to a known-good
+dense reference) is reusable across MoE, BSA, low-rank, etc.
+
+**Artifact:** `tests/smoke/test_bsa_tier_a_smoke.py::test_bsa_sparsity_zero_matches_dense`.
+
+---
+
+## L25. Conversion exits 0 but missing artifacts → check ALL expected files
+
+**What we hit:** The base DiT + LoRA conversion script exited 0 and the
+DiT was on disk (6 shards, 26 GB) — but the LoRA directory was
+**completely absent**. No error log (background tee was disconnected).
+The recipe quietly skipped the LoRA step.
+
+A second run of the *same* recipe finished the LoRAs in ~3 minutes
+because the skip-done sentinels short-circuited the already-finished
+components. The bug must have been in the first run's mid-step exit
+handling, but we never had to find it — the resumable recipe pattern
+made it free to recover from.
+
+**Rule for next port:**
+
+1. After any "done" notification on a conversion, **`ls -R` the output
+   dir against the expected layout** — exit code 0 + main outputs present
+   is NOT proof of completion.
+2. Build conversion recipes with **skip-done sentinels per component**
+   (`if (out / "component_name" / "marker.safetensors").exists(): skip`).
+   Idempotent re-run cost is one process startup + one filesystem walk;
+   non-idempotent re-run cost is hours of re-conversion. Always take
+   the cheap option.
+
+The Avatar port's recipe already follows this; the lesson here is to
+make the **post-conversion validation step explicit** in the workflow,
+not implicit in "well the exit code was 0."
+
+**Skill update target:** new entry in `weight-conversion.md` titled
+"Validate output layout after every conversion run." Cross-references the
+Avatar L4 (toolkit candidate: Conv*d transpose / gamma-skip) — same
+defensive posture.
+
+---
+
+## L26. Empty tee output from background shells: `&` + shell exit drops the redirect
+
+**What we hit:** We launched a long-running conversion as
+`.venv/bin/python ... 2>&1 | tee /tmp/log &`. The parent shell exited
+right after starting the background job. The `tee` process inherited the
+shell's stdio, which got disconnected → log file ended up zero bytes
+even though the Python process ran for ~25 minutes and produced output.
+
+Same pattern bit us twice — once for conversion, once for publish.
+
+**Rule for next port:**
+
+- Use `nohup cmd > log 2>&1 &` for true detached background runs
+  (writes directly to the file without a tee in the middle)
+- OR: foreground the process and let the harness's background-task tool
+  capture stdout (harness keeps the pipe alive even when your turn ends)
+- Never trust `cmd 2>&1 | tee log &` from a script — the lifecycle of
+  `tee` is tied to the launcher's stdio
+
+Best workaround we found: when the log is empty but you have other
+ground-truth signals (file appearances, `pgrep`), trust those instead and
+move on. Don't try to recover the missing log.
+
+**Skill update target:** new entry in `common-pitfalls.md` under
+"Long-running ops and background processes."
+
+---
+
+## L27. Implicit sibling-venv deps catch on a fresh venv install
+
+**What we hit:** `pipeline_t2v.py` imports `from mlx_arsenal.diffusion
+import FlowMatchEulerDiscreteScheduler` and `scripts/run_t2v.py` imports
+`from transformers import T5TokenizerFast`. Neither was listed in
+`pyproject.toml` — both happened to be installed in the Avatar repo's
+.venv, which our development venv had inherited some packages from. On
+the first publish/golden run from a clean state, both failed.
+
+**Rule for next port:** Run a `freshness` check before publishing:
+
+```bash
+# Bash: install only what pyproject declares + run smoke + run CLI --help
+python -m venv /tmp/fresh && \
+  /tmp/fresh/bin/pip install -e . && \
+  /tmp/fresh/bin/python -m pytest tests/smoke && \
+  /tmp/fresh/bin/python scripts/run_t2v.py --help
+```
+
+If the fresh-venv smoke passes but CLIs fail with `ModuleNotFoundError`,
+the deps are wrong. Repo-local venv passes the test because of
+cross-repo inheritance.
+
+For this port: added `mlx-arsenal>=0.10` to runtime deps; `transformers`
+stays in `[parity]` (the CLI now explains the install command when it
+hits the ImportError).
+
+**Skill update target:** new entry in `repo-layout.md` under a "Release
+sanity checks" subsection. Tagged toolkit-candidate if we can make the
+fresh-venv check a reusable script.
+
+---
+
+## L28. HF CLI v1.17 command surface (post-`huggingface-cli` rename)
+
+**What we hit:** `huggingface-cli` was renamed to `hf` in 2025. Several
+of Avatar's L19 commands changed shape:
+
+| Avatar (huggingface-cli) | Current (`hf` 1.17) |
+|---|---|
+| `huggingface-cli whoami` | `hf auth whoami` |
+| `huggingface-cli repo create --exist-ok` | `hf repos create --exist-ok` (note: **plural** — `hf repo` still works but is deprecated) |
+| `huggingface-cli upload` | `hf upload REPO_ID LOCAL_PATH PATH_IN_REPO` |
+| `huggingface-cli api /api/models/X` | `hf models info X` (no general `api` command) |
+
+Collections still work via `hf collections create/add-item/list`.
+**Collection description has a 150-char limit** — split the longer
+description into the model card README + a short collection blurb.
+
+**Rule for next port:** Pin `huggingface_hub>=0.34` in pyproject and use
+the `hf` commands above. The Avatar port's L19 still encodes the right
+*shape* (create-then-upload, exist-ok idempotency) but the literal
+commands have shifted.
+
+**Skill update target:** update `publish.md` with the new commands.
+Avatar L19 stays as the canonical pattern; add a v1.17 command table.
+
+---
+
+## L29. Stage README.md from `docs/model-cards/` before uploading
+
+**What we hit:** HF picks up `README.md` at the repo root as the canonical
+model card page. We keep the source-of-truth in
+`docs/model-cards/bf16.md` so it's git-tracked alongside code, but the
+upload target needs `README.md`. Easy footgun: forget to stage and the
+HF page renders an auto-generated placeholder.
+
+**Rule for next port:**
+
+```python
+# In the publish script:
+def stage_readme(variant_dir, model_card_md):
+    shutil.copy2(str(model_card_md), str(variant_dir / "README.md"))
+```
+
+Run the stage step **before** `hf upload`. If you're using `hf upload`'s
+`--exclude` filter, exclude the source `docs/model-cards/` dir but
+include the staged `README.md` at the variant root.
+
+**Skill update target:** add to `publish.md` as a required step in the
+publish flow.
+
+---
+
+## L30. Statistical signature of a tiny golden distinguishes real generation from noise
+
+**What we hit:** Wanted to verify the bf16 T2V pipeline works
+end-to-end without spending 30 minutes on a 50-step run. A 4-step run is
+visually garbage but should still produce *real diffusion trajectory
+statistics*, not pure noise.
+
+Pure-noise output signature:
+- mean ≈ 127 (centered uniform)
+- std ≈ 73 (uniform over [0, 255])
+- per-channel std ≈ uniform (R, G, B all ~73)
+- inter-frame mean abs diff ≈ 85 (no temporal correlation)
+
+Real-generation 4-step output signature (cat surfing prompt):
+- mean = 101 (image-like centering)
+- std = 63 (structured, not uniform)
+- per-channel std: R=58, G=57, B=61 (per-channel structure)
+- inter-frame mean abs diff: 67, 23, 32, 19 (first frame is the
+  noise→image transition; later frames have temporal continuity)
+
+That diverges enough from the noise baseline to call the pipeline
+**verified end-to-end** in seconds, without needing visual inspection or
+full quality.
+
+**Rule for next port:** When running a golden under a tight step budget,
+inspect:
+1. `arr.mean()`, `arr.std()` — should NOT match uniform-noise statistics
+2. Per-channel std — should vary across R / G / B
+3. Inter-frame difference — should decrease after the first transition
+
+If all three match noise statistics, the model is producing junk
+regardless of step count. Use this as the cheap "pipeline alive" check
+before scheduling a long golden.
+
+**Skill update target:** new entry in `validation.md` (or `numerics.md`
+if no validation doc yet) titled "Tiny-golden statistical signature."
+
+---
+
+## L31. MLX has no native trilinear; do separable bilinear+linear in fp32
+
+**What we hit:** Refinement upsamples a `[1, 3, T_old, H_old, W_old]`
+video to `[1, 3, T_new, H_new, W_new]` via trilinear interpolation. MLX
+has no native 5-D trilinear. Tried `mx.image` — only 2-D.
+
+The clean alternative: **separable trilinear = temporal linear ∘
+spatial bilinear** (the three axes are independent, so the order doesn't
+matter and the result is identical to true trilinear). MLX has neither
+1-D linear nor 2-D bilinear as a primitive — both are implemented via
+`mx.take` + linear interpolation:
+
+```python
+ts = mx.linspace(0.0, T - 1, num=new_T).astype(mx.float32)
+t0 = mx.floor(ts).astype(mx.int32)
+t1 = mx.minimum(t0 + 1, T - 1)
+wt = (ts - t0.astype(mx.float32))[None, None, :, None, None]
+a = mx.take(x, t0, axis=2); b = mx.take(x, t1, axis=2)
+result = a * (1.0 - wt) + b * wt
+```
+
+Critically, **do the whole resize in fp32** even when the rest of the
+forward is bf16. Resampling in bf16 spuriously washes detail and
+contaminates the VAE encode step downstream.
+
+**Rule for next port:** When you need a higher-D resampling primitive
+MLX doesn't ship, decompose into per-axis 1-D linear (separable) and run
+in fp32. Cast back to the model's working dtype after.
+
+**Skill update target:** new entry in `numerics.md` titled "Resampling
+in MLX — separable + fp32." Tagged toolkit-candidate if the helper
+generalizes to N-D.
+
+---
+
+## L32. SDEdit-style refinement: partial-noise + truncated schedule + frozen cond
+
+**What we hit:** Refinement (`refinement.py`) is NOT fresh sampling from
+pure noise. It's SDEdit-style: VAE-encode the upsampled coarse video,
+inject partial noise at threshold τ, then denoise only the
+`timesteps ≤ τ*1000` portion of the schedule.
+
+Three traps:
+
+1. **Schedule truncation must happen on the scheduler's `timesteps`
+   array, not just the loop range.** Insert τ*1000 itself at the head:
+   `timesteps = [τ*1000, then timesteps where t < τ*1000]`.
+2. **Cond latents are frozen at t=0 throughout** —
+   `timestep[:, :num_cond_latents] = 0` AND `scheduler.step` updates
+   only the noise slice (`latents[:, :, num_cond_latents:]`).
+3. **No CFG** — refinement_lora is trained at guidance_scale=1.0, so the
+   loop does a single forward per step. 50 nominal refinement steps ≈
+   25 actual denoising steps, ≈ same wall-time as 25 baseline T2V steps
+   (each of which is 2 forwards for CFG).
+
+Found these by literally diffing our pipeline against upstream's
+`generate_refine` (lines 1098-1340) and missing all three on the first
+pass.
+
+**Rule for next port:** When porting any "refinement" / "img2img" /
+"high-res fix" pipeline, treat it as a *separate flow* from the main
+sampling pipeline. Specifically check:
+
+- Are timesteps truncated? (look for `t_thresh`, `cutoff`, `start_step`)
+- Are some latents frozen at t=0? (look for `num_cond_latents`,
+  `timestep[:N] = 0`)
+- Is CFG disabled? (look for `guidance_scale=1.0` defaults in the run
+  script, and whether the loop does 1 or 2 DiT forwards)
+
+Don't copy your baseline sampler's structure — refinement is a different
+algorithm.
+
+**Skill update target:** new section in a new doc `refinement-passes.md`
+under `mlx-porting/concepts/`. Covers SDEdit, ControlNet-style guidance,
+high-res fix — all variations of the same partial-noise-denoise pattern.
+
+---
+
+## L33. Orchestration pipelines must share sub-pipeline component instances
+
+**What we hit:** Long-Video and Interactive pipelines internally build a
+T2V pipeline + a Continuation pipeline. Naive impl would let each
+sub-pipeline load its own VAE / umT5 / DiT — but those are 26 GB / 11 GB
+/ 242 MB. Two copies of the DiT alone would blow unified memory on a
+64 GB machine.
+
+The orchestrator must construct the sub-pipelines with the **same component
+instances**:
+
+```python
+self.t2v = LongCatVideoT2VPipeline(vae, text_encoder, dit, config=...)
+self.continuation = LongCatVideoContinuationPipeline(vae, text_encoder, dit, config=...)
+```
+
+And we lock this with an explicit test:
+
+```python
+def test_subpipelines_share_components():
+    pipe = Pipeline(vae=vae_stub, ...)
+    assert pipe.t2v.vae is pipe.continuation.vae   # `is`, not `==`
+    assert pipe.t2v.dit is pipe.continuation.dit
+```
+
+**Rule for next port:** When an orchestration layer holds two or more
+sub-pipelines that share model components, write a `is`-identity test
+in smoke. Catches the "I'll just re-instantiate inside" refactor before
+it lands.
+
+**Skill update target:** add to `common-pitfalls.md` under a new
+"Orchestration / multi-stage pipelines" section.
+
+---
+
+## L34. Mixed-Q-and-K-seq attention should opt out of BSA, not toggle per-block
+
+**What we hit:** BSA assumes a uniform 3-D token grid where Q and K
+share the same `(T, H, W)` layout. But several paths in the DiT have
+mixed Q/K sequence lengths:
+
+- KV-cache continuation: Q is the new chunk, K includes the cached prefix
+- Cond-noise branch: Q = noise tokens, K = full cond + noise
+
+If you try to run BSA on these, the block indexing breaks (Q-block ids
+don't map to K-block ids cleanly).
+
+Cleanest fix: have `_process_attn(q, k, v, shape=None)` accept a 3-D
+`shape` hint and **fall back to dense SDPA when `shape is None`**. The
+caller passes `shape=None` for any branch where Q-seq ≠ K-seq:
+
+```python
+if self.enable_bsa and shape is not None and q.shape[-2] == k.shape[-2]:
+    return bsa_attention(q, k, v, shape=shape, ...)
+return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+```
+
+No per-block toggles, no special-case branches. The `shape` parameter
+naturally encodes "this is a uniform-grid self-attention" — anything else
+is dense.
+
+**Rule for next port:** When wiring a structured-attention variant (BSA,
+windowed, axial), make the structured path *opt-in via the shape hint*
+and dense the default. Don't try to make the structured op handle all
+the corner cases — let the call site decide.
+
+**Skill update target:** add to `common-pitfalls.md` under
+"Sparse/structured attention call sites."
+
+---
+
+## L35. Document-level milestones belong in MEMORY, not commit messages
+
+**What we hit:** Across this port we landed 10 PRs in one day. Each PR
+has a useful body but the *cross-PR narrative* ("we discovered BSA
+params in the config, which closed Open Question #1 from the plan; then
+we shipped T2V → I2V → Continuation → Refinement → BSA Tier A in
+sequence") only lives in the user's auto-memory.
+
+If the user comes back in 3 weeks asking "what's the state of LongCat?"
+the natural answer is "look at the memory checkpoint" — not "scan 10
+PR bodies in order." We did this correctly in this port by updating
+`MEMORY.md` at the end with a port-level summary entry.
+
+**Rule for next port:** At every meaningful milestone (weights published,
+all variants shipped, parity hit), write a one-paragraph milestone entry
+into the user's `MEMORY.md` linking to a per-port memory doc with the
+PR list, HF artifacts, statistics, and pending work. The doc is the
+**resumption point** for the next session.
+
+**Skill update target:** add to `workflow.md` (if it exists) or
+`repo-layout.md` under "Session continuity."
+
+---
+
+## L36. `mx.argpartition` for top-k: kth-element-bottom, flip sign for top
+
+**What we hit:** BSA top-k routing needs the indices of the K largest
+scores. MLX's `mx.argpartition(x, kth, axis)` returns indices arranged
+so the `kth` position holds the kth-*smallest* value — bottom-k by
+default. For top-k, negate:
+
+```python
+# Top-k by score value:
+neg_score = -score
+part = mx.argpartition(neg_score, kth=num_selected - 1, axis=-1)
+top_k_indices = part[..., :num_selected]
+```
+
+The `kth=num_selected - 1` (not `num_selected`) is also a footgun — MLX
+matches NumPy's convention where `kth` is the *index* of the partition
+point, not the *count* of items below it.
+
+**Rule for next port:** For top-k in MLX:
+- `argpartition(x, k-1)` returns indices where positions `[0:k]` are
+  the k smallest (in some order)
+- For top-k by VALUE, negate the input first
+- Sanity-check by computing `take_along_axis(x, top_k, ...)` and
+  verifying all selected values are above the unselected median
+
+**Skill update target:** new entry in `mlx-builtins.md` (if exists) or
+`numerics.md` titled "Top-k via `mx.argpartition`."
+
+---
+
+## L37. Token-block index map: pure-Python flat-index → 3-D block coord lookup
+
+**What we hit:** BSA needs to expand a per-Q-block-pair routing decision
+to a per-token-pair attention mask. Naively this would require a giant
+gather over the routing matrix. Cleaner approach: precompute a
+`[S]` lookup table `token_block_index[s]` that gives the block id for
+each flat token index `s`:
+
+```python
+s = mx.arange(T * H_ * W, dtype=mx.int32)
+t = s // (H_ * W)
+hw = s % (H_ * W)
+h = hw // W
+w = hw % W
+bt = t // cT; bh = h // cH; bw = w // cW
+return bt * (Bh * Bw) + bh * Bw + bw
+```
+
+Then the token-pair mask is just two `mx.take`s:
+
+```python
+expanded_q = mx.take(block_pair_mask, token_block_index, axis=-2)
+token_pair_mask = mx.take(expanded_q, token_block_index, axis=-1)
+```
+
+Result: `[B, H, S, S]` bool from `[B, H, num_q_blocks, num_kv_blocks]`
+bool in two ops. No loops, no scatter, no kronecker.
+
+**Rule for next port:** When expanding a coarse-resolution decision
+(block-level routing, patch-level scores, etc.) to a fine-resolution
+target (per-token mask, per-pixel attention), precompute the
+**coarse-to-fine index table** once and use `take` along each axis.
+Cleanest pattern we've found in MLX for this class of op.
+
+**Skill update target:** new section in `numerics.md` titled
+"Coarse-to-fine expansion via per-axis `take`." Tagged toolkit-candidate
+if the index table generalizes (it does — same pattern works for
+windowed attention, axial decompositions, hierarchical routing).
+
+---
+
+## L38. Skip-done sentinels per component make re-runs free `[toolkit candidate]`
+
+**What we hit:** This is a reinforcement of patterns already in the
+Avatar port, but bears explicit calling-out because it saved us hours.
+
+Every conversion / build step that writes a multi-GB artifact should
+check whether that artifact already exists before re-doing the work:
+
+```python
+def _component_done(out_dir, component, marker_file):
+    return (out_dir / component / marker_file).exists()
+
+if skip_done and _component_done(out_dir, "dit",
+                                 "diffusion_pytorch_model.safetensors.index.json"):
+    print("  DiT already converted — skipping")
+else:
+    convert_dit(out_dir)
+```
+
+In our case, the DiT conversion took ~25 min and the umT5 took ~15 min.
+When the LoRA step silently failed (L25), the second run of the same
+recipe completed both LoRAs in ~3 min because everything else was
+already done. **The recipe is its own checkpoint.**
+
+**Rule for next port:** Every multi-step conversion / build recipe must
+have **per-component skip-done sentinels keyed off real output files**
+(not arbitrary marker files — use the actual artifacts the step
+produces). Re-running the recipe should always be safe and ~instant if
+nothing changed.
+
+**Skill update target:** strengthen the existing guidance in
+`weight-conversion.md` with the per-step pattern shown above. Cross-ref
+L25 (post-conversion validation is the safety net; skip-done sentinels
+are the recovery mechanism).
+
+---
+
+## Toolkit candidates (running tally — Avatar + base)
+
+Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
+
+**From Avatar (L1–L22):**
+- L4: Conv*d transpose / gamma-skip in safetensors loader
+- L7: HF Range-request safetensors header inspection
+- The `diag_*.py` bisection template
+- The `[parity]` extras pattern
+- Smoke/parity split with HF auto-download env var
+- L19: HF publish (`repos create --exist-ok` + `upload`)
+- L20: Large-repo upload stall handling
+- L21: `xcodebuild test` over `swift test` for metallib bundling
+- L22: bf16 GPU matmul Python-vs-Swift divergence
+
+**Added in this port (L23–L38):**
+- L23: Read published `config.json` before source-spelunking
+- L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
+- L27 (partial): Fresh-venv release check
+- L31 (partial): Separable resampling helper
+- L37 (partial): Coarse-to-fine `take` expansion table
+- L38: Per-component skip-done sentinels (reinforces Avatar pattern)
+
+When 3+ ports in a row use the same pattern, that's the extraction trigger.
