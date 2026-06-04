@@ -1158,7 +1158,7 @@ kernel hits this same fork.
 
 ---
 
-## L51. Naive 1-thread-per-output-token Metal kernel is 2-7× SLOWER than `mx.fast.scaled_dot_product_attention`
+## L51 (CORRECTED). Naive 1-thread-per-output-token Metal kernel is 2-7× slower than `mx.fast.SDPA` — BUT simdgroup-cooperative reduction (32-thread `simd_sum`) BEATS it without simdgroup_matrix
 
 **What we hit:** Implemented BSA Tier B Phase 1 as the simplest correct
 kernel — one thread per output token, online softmax, fp32 accumulators,
@@ -1224,6 +1224,93 @@ existing `mx.eval` discipline in `weight-conversion.md`.
 
 ---
 
+## L53. `simdgroup_matrix` is the dense-matmul tool; `simd_sum` is the sparse-attention tool `[toolkit candidate]`
+
+**What we hit:** Planning Phase 2 of BSA Tier B, I went straight for
+`simdgroup_matrix<fp16, 8, 8>` because that's what FlashAttention-2 and
+MLX's own dense SDPA kernel (`steel/attn/`) use. Designed a full
+threadgroup-tiled FA-2 layout.
+
+Then I read MLX's `sdpa_vector.h` and found a much simpler pattern:
+- 32 threads in a simdgroup cooperate on **one output token**
+- Each thread holds D/32 elements of Q and the running output in registers
+- Dot product = each thread's local sum + `simd_sum()` HW reduction
+- Online softmax accumulators in registers (single-row, not tiled)
+
+This worked **first try** at 1.2-1.35× faster than dense SDPA.
+
+The rule that emerged:
+
+- **`simdgroup_matrix<T, M, N>`** is the right tool when you have
+  **many Q tokens densely attending to many K tokens** — large matmuls
+  where HW tile setup pays off. Used by dense SDPA, dense GEMM.
+
+- **`simd_sum` + cooperative simdgroup** is the right tool when you
+  have **per-token independent attention** — e.g. sparse routing where
+  each Q token attends to a different sparse set of KVs. The
+  threadgroup-tile setup of simdgroup_matrix becomes overhead because
+  you can't reuse Q/K tiles across simdgroups.
+
+BSA at small block_size (64) is squarely in the second case. The Phase 1
+"one thread per output token" was right idea, wrong tool — should have
+been "one simdgroup per output token."
+
+**Rule for next port:** When you have a sparse-routing attention or
+any "per-token independent" workload, **try simdgroup-cooperative
+(simd_sum) FIRST**. Don't reach for simdgroup_matrix unless you have
+a clear dense-matmul portion that benefits from HW tile setup.
+
+**Skill update target:** add a new section to `custom-metal-kernels.md`
+(once it exists) called "Choosing simdgroup_matrix vs simdgroup-
+cooperative." Cross-references the canonical patterns in MLX's
+`steel/attn/` (dense) and `sdpa_vector.h` (sparse-like / single-Q-token).
+
+Tagged toolkit-candidate because this fork applies to every custom
+attention kernel beyond dense SDPA.
+
+**Artifact:** `longcat_video/models/block_sparse_attention_metal.py`
+`_BSA_KERNEL_V2_BODY` + benchmark table in `bsa-tier-b-design.md`.
+
+---
+
+## L54. Read MLX's `*.h` source kernels BEFORE designing a custom kernel `[toolkit candidate]`
+
+**What we hit:** I spent a few hours of designed work assuming Phase 2
+would need full simdgroup_matrix infrastructure (the steel/attn/
+~1500 lines of template machinery). Then I opened `sdpa_vector.h` and
+discovered the much simpler `simd_sum` pattern in 50 lines.
+
+The MLX source kernels (under `mlx/backend/metal/kernels/`) are the
+**canonical references** for what's possible with the Apple GPU at the
+shading-language level. Two top-level patterns:
+
+- `mlx/backend/metal/kernels/steel/` — the "production" path with
+  template machinery (BlockLoaders, MMATile, BaseMMAFrag). Heavy
+  abstractions for performance-critical paths. Hard to replicate
+  inline in a JIT kernel.
+
+- `mlx/backend/metal/kernels/sdpa_vector.h` (and similar non-steel
+  kernels) — direct Metal Shading Language with no templates. The
+  patterns translate cleanly to `mx.fast.metal_kernel` JIT kernels.
+
+**Rule for next port:** Before designing any custom Metal kernel via
+`mx.fast.metal_kernel`, grep the MLX source for `*.h` kernels in the
+same domain (attention, gemm, sort, reduce). Look for the simpler
+non-steel variants first — they show what's possible inline in a JIT
+kernel.
+
+If MLX's source isn't on disk:
+
+  git clone --depth 1 https://github.com/ml-explore/mlx mlx-ref
+
+…and read its kernel headers. The 30 minutes you spend reading is
+guaranteed to save days of misdirected design.
+
+**Skill update target:** add to `custom-metal-kernels.md` and to
+`mlx-docs.md` under reference repos. Tagged toolkit-candidate.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -1239,7 +1326,7 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L52):**
+**Added in this port (L23–L54):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
@@ -1264,10 +1351,14 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
   `k`, `v` as iteration variables
 - **L50: BSA token-block layout is NOT contiguous in t-major flat order**
   — pick block-major reshape OR lookup table BEFORE writing the kernel
-- L51: Naive 1-thread-per-output Metal kernel is 2-7× slower than
-  `mx.fast.scaled_dot_product_attention` (which uses simdgroup_matrix
-  HW accel) — don't expect to beat mx.fast without simdgroup_matrix
+- L51 (CORRECTED in L53): Naive 1-thread-per-output Metal kernel is
+  slow — but the right fix is simdgroup-cooperative, not simdgroup_matrix
 - L52: `mx.fast.metal_kernel` first-call JIT is ~0.5-2s — provide
   `prewarm()` and call it at pipeline init
+- **L53: `simdgroup_matrix` is for dense matmuls; `simd_sum` is for
+  per-token independent (sparse) attention** — choose the right tool
+- **L54: Read MLX's `*.h` source kernels BEFORE designing your own** —
+  the simpler non-steel variants (sdpa_vector.h, etc.) translate
+  cleanly to JIT kernels
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.

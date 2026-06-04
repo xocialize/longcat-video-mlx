@@ -26,12 +26,13 @@ def _import_smoke():
     )
     from longcat_video.models.block_sparse_attention_metal import (
         bsa_attention_metal,
+        bsa_attention_metal_v2,
         prewarm_metal_kernel,
     )
     return (
         bsa_attention, bsa_attention_metal,
         topk_block_indices, block_routing_scores, mean_pool_blocks_3d,
-        prewarm_metal_kernel,
+        prewarm_metal_kernel, bsa_attention_metal_v2,
     )
 
 
@@ -118,7 +119,7 @@ def test_metal_kernel_partial_sparsity_matches_tier_a():
     kernel output must match Tier A's pure-MLX path within fp32 noise.
     Both consume the SAME `block_indices`, so the only difference is the
     computational path (kernel vs masked dense SDPA)."""
-    bsa_a, bsa_metal, topk, scores_fn, mean_pool, _ = _import_smoke()
+    bsa_a, bsa_metal, topk, scores_fn, mean_pool, _, _ = _import_smoke()
 
     # 8×8×8 latent = 2×2×2 = 8 blocks of 64 tokens
     T, H_lat, W_lat = 8, 8, 8
@@ -173,5 +174,113 @@ def test_metal_kernel_rejects_misaligned_S():
 
 def test_prewarm_runs_without_error():
     """Prewarm should JIT-compile cached kernels without crashing."""
-    *_, prewarm = _import_smoke()
+    bsa_a, bsa_metal, topk, scores_fn, mean_pool, prewarm, _ = _import_smoke()
     prewarm(head_dim=16, block_size=64, top_k_values=(1,), dtype=mx.float32)
+
+
+# ----- Phase 2 (simdgroup-cooperative kernel) tests -----------------------
+
+def test_phase2_degenerate_case_matches_dense_fp32():
+    """Phase 2 + sparsity=0 ≡ dense SDPA. Same gate as Phase 1, but for
+    the simdgroup-cooperative kernel."""
+    *_, bsa_v2 = _import_smoke()
+
+    # D must be a multiple of 32 for Phase 2
+    T, H_lat, W_lat = 4, 4, 4
+    S = T * H_lat * W_lat   # = 64
+    B, num_heads, D = 1, 2, 64
+
+    mx.random.seed(0)
+    q = mx.random.normal((B, num_heads, S, D))
+    k = mx.random.normal((B, num_heads, S, D))
+    v = mx.random.normal((B, num_heads, S, D))
+    mx.eval(q, k, v)
+
+    sm_scale = 1.0 / math.sqrt(D)
+    out_dense = mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=sm_scale,
+    )
+    block_indices = mx.zeros((B, num_heads, 1, 1), dtype=mx.int32)
+    out_p2 = bsa_v2(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    mx.eval(out_dense, out_p2)
+
+    diff = float(mx.max(mx.abs(out_p2 - out_dense)))
+    assert diff < 5e-3, (
+        f"Phase 2 degenerate case: max_abs={diff:.3e}"
+    )
+
+
+def test_phase2_matches_phase1():
+    """Phase 1 and Phase 2 are mathematically equivalent — both compute
+    online-softmax block-sparse attention with the same routing. They
+    differ only in HW utilization (Phase 2 uses simd_sum reduction).
+    """
+    _, bsa_p1, *_, bsa_v2 = _import_smoke()
+
+    T, H_lat, W_lat = 8, 8, 8
+    S = T * H_lat * W_lat
+    B, num_heads, D = 1, 4, 64
+    num_blocks = (T // 4) * (H_lat // 4) * (W_lat // 4)  # 8
+
+    mx.random.seed(42)
+    q = mx.random.normal((B, num_heads, S, D))
+    k = mx.random.normal((B, num_heads, S, D))
+    v = mx.random.normal((B, num_heads, S, D))
+    mx.eval(q, k, v)
+
+    # Top-k=3 (keep 3 of 8 blocks)
+    block_indices = mx.broadcast_to(
+        mx.arange(3, dtype=mx.int32),
+        (B, num_heads, num_blocks, 3),
+    )
+    out_p1 = bsa_p1(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    out_p2 = bsa_v2(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    mx.eval(out_p1, out_p2)
+
+    diff = float(mx.max(mx.abs(out_p2 - out_p1)))
+    # Both use fp32 accumulators, so should agree within fp32 noise
+    # (the slight difference comes from sum order in simd_sum vs serial)
+    assert diff < 1e-3, f"Phase 1 vs Phase 2: max_abs={diff:.3e}"
+
+
+def test_phase2_matches_tier_a_partial_sparsity():
+    """Phase 2 with routed block_indices should match Tier A pure-MLX
+    output within fp32 noise."""
+    bsa_a, _, topk, scores_fn, mean_pool, _, bsa_v2 = _import_smoke()
+
+    T, H_lat, W_lat = 8, 8, 8
+    S = T * H_lat * W_lat
+    B, num_heads, D = 1, 4, 64
+
+    mx.random.seed(7)
+    q = mx.random.normal((B, num_heads, S, D))
+    k = mx.random.normal((B, num_heads, S, D))
+    v = mx.random.normal((B, num_heads, S, D))
+    mx.eval(q, k, v)
+
+    q_blocks = mean_pool(q, shape=(T, H_lat, W_lat))
+    k_blocks = mean_pool(k, shape=(T, H_lat, W_lat))
+    score = scores_fn(q_blocks, k_blocks)
+    block_indices, n_selected = topk(score, sparsity=0.5)
+
+    out_a = bsa_a(q, k, v, shape=(T, H_lat, W_lat), sparsity=0.5)
+    out_p2 = bsa_v2(q, k, v, block_indices, chunk_thw=(4, 4, 4),
+                   shape=(T, H_lat, W_lat))
+    mx.eval(out_a, out_p2)
+
+    diff = float(mx.max(mx.abs(out_p2 - out_a)))
+    assert diff < 5e-3, f"Phase 2 vs Tier A: max_abs={diff:.3e}"
+
+
+def test_phase2_rejects_non_multiple_of_32_head_dim():
+    """Phase 2 requires D % 32 == 0 (the simdgroup width)."""
+    *_, bsa_v2 = _import_smoke()
+    q = mx.zeros((1, 1, 64, 24))  # D=24, not a multiple of 32
+    k = mx.zeros((1, 1, 64, 24))
+    v = mx.zeros((1, 1, 64, 24))
+    bi = mx.zeros((1, 1, 1, 1), dtype=mx.int32)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        bsa_v2(q, k, v, bi, chunk_thw=(4, 4, 4), shape=(4, 4, 4))

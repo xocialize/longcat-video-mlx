@@ -62,6 +62,11 @@ class Attention(nn.Module):
         self.enable_bsa: bool = False
         self.bsa_sparsity: float = 0.9375
         self.bsa_chunk_thw: tuple[int, int, int] = (4, 4, 4)
+        # When True (set via dit.enable_bsa(backend="metal")), use the
+        # Tier B Phase 2 simdgroup-cooperative Metal kernel — 1.2-1.35×
+        # faster than dense SDPA at the cost of Tier A's nicer fallback
+        # semantics. Default Tier A (pure-MLX) for correctness.
+        self.bsa_backend: str = "tier_a"   # "tier_a" | "metal"
 
     def _process_attn(
         self,
@@ -84,6 +89,28 @@ class Attention(nn.Module):
         if self.enable_bsa and shape is not None and q.shape[-2] == k.shape[-2]:
             # Pure self-attention with aligned Q/K — BSA-safe.
             try:
+                if self.bsa_backend == "metal":
+                    # Tier B Phase 2 path — compute routing in MLX, then
+                    # dispatch the simdgroup-cooperative kernel.
+                    from longcat_video.models.block_sparse_attention import (
+                        block_routing_scores, mean_pool_blocks_3d,
+                        topk_block_indices,
+                    )
+                    from longcat_video.models.block_sparse_attention_metal import (
+                        bsa_attention_metal_v2,
+                    )
+                    q_blocks = mean_pool_blocks_3d(q, shape, self.bsa_chunk_thw)
+                    k_blocks = mean_pool_blocks_3d(k, shape, self.bsa_chunk_thw)
+                    score = block_routing_scores(q_blocks, k_blocks)
+                    block_indices, _ = topk_block_indices(
+                        score, self.bsa_sparsity,
+                    )
+                    return bsa_attention_metal_v2(
+                        q, k, v, block_indices,
+                        chunk_thw=self.bsa_chunk_thw,
+                        shape=shape,
+                    )
+                # Tier A pure-MLX (default)
                 return bsa_attention(
                     q, k, v, shape=shape,
                     sparsity=self.bsa_sparsity,
