@@ -41,7 +41,11 @@ from _common import (
 )
 
 
-def build_pipeline(weights_dir: pathlib.Path, with_cfg_step_lora: bool):
+def build_pipeline(
+    weights_dir: pathlib.Path,
+    with_cfg_step_lora: bool,
+    variant: str = "auto",
+):
     """Load all components from the converted bf16 dir + wire the pipeline.
 
     Expected layout (matches recipes/convert_longcat_video.py output):
@@ -56,7 +60,7 @@ def build_pipeline(weights_dir: pathlib.Path, with_cfg_step_lora: bool):
     from longcat_video.pipeline_t2v import LongCatVideoT2VPipeline, T2VPipelineConfig
 
     # Shared load helper — same plumbing as I2V / Continuation / Refinement.
-    vae, umt5, dit, variant_dir = load_components(weights_dir)
+    vae, umt5, dit, variant_dir = load_components(weights_dir, variant=variant)
 
     # Build pipeline
     cfg = T2VPipelineConfig()
@@ -75,13 +79,15 @@ def build_pipeline(weights_dir: pathlib.Path, with_cfg_step_lora: bool):
               f"cfg_collapse=True, {cfg.num_sampling_steps} steps, "
               f"guidance_scale=0")
 
-    return pipeline, cfg
+    return pipeline, cfg, variant_dir
 
 
 def main():
     parser = argparse.ArgumentParser(description="LongCat-Video T2V inference")
     parser.add_argument("--weights", type=pathlib.Path, required=True,
-                        help="Parent dir containing LongCat-Video-bf16/")
+                        help="Parent dir containing one or more LongCat-Video-{bf16,q4,q8}/ subdirs")
+    parser.add_argument("--variant", choices=["auto", "bf16", "q4", "q8"], default="auto",
+                        help="Which variant to load (default: auto — picks bf16 > q8 > q4)")
     parser.add_argument("--prompt", required=True,
                         help="Text prompt for the video")
     parser.add_argument("--negative-prompt", default="",
@@ -108,12 +114,12 @@ def main():
 
     print("[1/5] Building pipeline (loading converted weights)...")
     t0 = time.time()
-    pipeline, cfg = build_pipeline(args.weights, with_cfg_step_lora=args.cfg_step_lora)
+    pipeline, cfg, variant_dir = build_pipeline(
+        args.weights, with_cfg_step_lora=args.cfg_step_lora, variant=args.variant,
+    )
     if args.num_steps:
         pipeline.config.num_sampling_steps = args.num_steps
     print(f"  pipeline loaded in {time.time() - t0:.1f}s")
-
-    variant_dir = args.weights / "LongCat-Video-bf16"
 
     print("[2/5] Tokenizing + encoding prompt via umT5...")
     text_embeds, text_mask, uncond_embeds, uncond_mask = encode_prompts(

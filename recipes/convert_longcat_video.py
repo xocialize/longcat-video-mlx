@@ -5,37 +5,48 @@ Mirrors the structure of `longcat-avatar-mlx/recipes/convert_longcat_avatar.py`
 base model's HF repo `meituan-longcat/LongCat-Video` and the different
 LoRA setup.
 
-Produces ONE publishable variant in per-component HF subdir layout:
+Produces THREE publishable variants in per-component HF subdir layout:
 
-    mlx-community/LongCat-Video-bf16/
-        vae/diffusion_pytorch_model.safetensors                ( ~254 MB bf16)
+    mlx-community/LongCat-Video-bf16/                          (~42 GB)
+        vae/diffusion_pytorch_model.safetensors                (~254 MB bf16)
         text_encoder/{...sharded umT5 bf16...}                 (~11 GB)
-        dit/{...sharded base DiT bf16...}                      (~28 GB)
-        lora/cfg_step_lora.safetensors                         (~2.5 GB)
-        lora/refinement_lora.safetensors                       (~3.2 GB)
+        dit/{...sharded base DiT bf16...}                      (~26 GB)
+        lora/cfg_step_lora.safetensors                         (~2.3 GB)
+        lora/refinement_lora.safetensors                       (~3.0 GB)
         scheduler/scheduler_config.json
         tokenizer/                                             (umT5 SentencePiece)
         pipeline_config.json
         README.md
 
+    mlx-community/LongCat-Video-q4/                            (~22 GB)
+        dit/                                                   (~7 GB q4)
+        (VAE / umT5 / LoRAs / scheduler / tokenizer same as bf16)
+
+    mlx-community/LongCat-Video-q8/                            (~30 GB)
+        dit/                                                   (~13 GB q8)
+        (same)
+
 End users call the pipelines with optional LoRA merge:
 - T2V baseline: load DiT alone (50-step Flow Matching)
-- T2V fast: merge `cfg_step_lora` for collapsed CFG + reduced step count
-- 720p refinement pass: merge `refinement_lora` after the coarse pass
+- T2V fast: merge `cfg_step_lora` for collapsed CFG + 8-step inference
+- 720p refinement: merge `refinement_lora` + enable BSA
 
-Quantized (q4/q8) variants land in B5.4 — same `nn.quantize` pattern as
-the Avatar port, with the same DIT_QUANT_SKIP_PATTERNS.
+The q4 and q8 variants are built **from the already-converted bf16 DiT
+on disk** — they don't re-download from PT. VAE / umT5 / LoRAs stay bf16
+in all three variants (quantizing them would degrade output more than
+save space).
 
 CRITICAL: every saved tensor is materialized via `mx.eval` immediately
 before `mx.save_safetensors`. Lazy MLX tensors serialize as ZEROS with no
 error (the mlx-porting skill's silent-killer warning).
 
 Usage:
-    .venv/bin/python -m recipes.convert_longcat_video --out <PATH>
+    .venv/bin/python -m recipes.convert_longcat_video --out <PATH> --variant bf16
+    .venv/bin/python -m recipes.convert_longcat_video --out <PATH> --variant q4
+    .venv/bin/python -m recipes.convert_longcat_video --out <PATH> --variant q8
+    .venv/bin/python -m recipes.convert_longcat_video --out <PATH> --variant all
 
 Requires `huggingface_hub` + `safetensors` (already in `[parity]` extras).
-Uses ~90 GB of disk total (~54 GB source DiT + ~28 GB output DiT + ~22 GB
-source umT5 + ~11 GB output umT5 + LoRAs + small components).
 """
 
 from __future__ import annotations
@@ -56,6 +67,121 @@ import numpy as np
 
 BASE_REPO = "meituan-longcat/LongCat-Video"
 PUBLISH_REPO_BF16 = "mlx-community/LongCat-Video-bf16"
+PUBLISH_REPO_Q4 = "mlx-community/LongCat-Video-q4"
+PUBLISH_REPO_Q8 = "mlx-community/LongCat-Video-q8"
+
+
+# ---------------------------------------------------------------------------
+# Quantization
+# ---------------------------------------------------------------------------
+
+# Patterns whose Linear modules must NOT be quantized. Matches Avatar's DiT
+# (same 48-block architecture) and Meituan's documented skip pattern.
+# - `final_layer.linear`: Meituan's published skip (preserves output quality)
+# - `t_embedder.`: TimestepEmbedder MLP — small + sensitive (Linear 256→512
+#   and 512→512). Drives `adaLN_modulation` input dim — see L11/L42.
+# - `y_embedder.`: CaptionEmbedder MLP — small + sensitive
+# - `adaLN_modulation.`: per-block AdaLN-Zero modulation. **MUST stay fp**
+#   per L11 — silent accumulation bug if quantized.
+DIT_QUANT_SKIP_PATTERNS: list[str] = [
+    "final_layer.linear",
+    "t_embedder.",
+    "y_embedder.",
+    "adaLN_modulation.",
+]
+
+
+def _should_quantize_dit_linear(path: str, module) -> bool:
+    """class_predicate for `mlx.nn.quantize` on the DiT.
+
+    Quantizes `nn.Linear` only; skips per `DIT_QUANT_SKIP_PATTERNS`.
+    """
+    import mlx.nn as nn
+
+    if not isinstance(module, nn.Linear):
+        return False
+    for pat in DIT_QUANT_SKIP_PATTERNS:
+        if pat in path:
+            return False
+    return True
+
+
+def _write_dit_config_with_quant(
+    out_dir: pathlib.Path, bits: int, group_size: int,
+) -> None:
+    """Copy Meituan's `dit/config.json` then inject a `quantization` block
+    so the runtime loader applies `nn.quantize` before `load_weights`.
+    """
+    from huggingface_hub import hf_hub_download
+
+    src = hf_hub_download(repo_id=BASE_REPO, filename="dit/config.json")
+    cfg = json.loads(pathlib.Path(src).read_text())
+    cfg["quantization"] = {
+        "method": "mlx.nn.quantize",
+        "bits": bits,
+        "group_size": group_size,
+        "skip_patterns": DIT_QUANT_SKIP_PATTERNS,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+
+def quantize_dit_from_bf16(
+    bf16_variant_dir: pathlib.Path,
+    out_dir: pathlib.Path,
+    *,
+    bits: int,
+    group_size: int = 64,
+) -> None:
+    """Quantize the already-converted bf16 DiT to `bits`-bit and write it
+    to `out_dir/dit/`. Re-uses the bf16 weights on disk — does NOT re-
+    download from PT.
+
+    Args:
+        bf16_variant_dir: Path to existing `LongCat-Video-bf16/` directory.
+        out_dir: Path to write `LongCat-Video-q{bits}/dit/...` under.
+        bits: 4 or 8.
+        group_size: quantization group size. Default 64 (mlx-lm convention).
+    """
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from longcat_video.models.longcat_video_dit import LongCatVideoTransformer3DModel
+
+    assert bits in (4, 8), f"bits must be 4 or 8, got {bits}"
+
+    src_dit_dir = bf16_variant_dir / "dit"
+    print(f"  Quantizing DiT to {bits}-bit (group_size={group_size}) from "
+          f"{src_dit_dir}/ → {out_dir}/dit/")
+
+    # 1. Construct the model from the bf16 config (no quantization block —
+    # we're quantizing FROM bf16, the output config gets the quant block
+    # written separately via _write_dit_config_with_quant).
+    dit_cfg = json.loads((src_dit_dir / "config.json").read_text())
+    dit_cfg.pop("quantization", None)   # ignore if upstream already has one
+    model = LongCatVideoTransformer3DModel.from_config(dit_cfg)
+
+    # 2. Load bf16 shards
+    idx = json.loads((src_dit_dir / "diffusion_pytorch_model.safetensors.index.json").read_text())
+    for shard_name in sorted(set(idx["weight_map"].values())):
+        model.load_weights(str(src_dit_dir / shard_name), strict=False)
+    mx.eval(model.parameters())
+
+    # 3. Quantize Linears in place (skip per DIT_QUANT_SKIP_PATTERNS)
+    nn.quantize(
+        model,
+        group_size=group_size,
+        bits=bits,
+        class_predicate=_should_quantize_dit_linear,
+    )
+
+    # 4. Snapshot the now-quantized parameter tree
+    quantized_sd = dict(tree_flatten(model.parameters()))
+    del model
+
+    _save_sharded_safetensors(quantized_sd, out_dir / "dit",
+                              base_name="diffusion_pytorch_model")
+    _write_dit_config_with_quant(out_dir / "dit", bits=bits, group_size=group_size)
 
 
 # ---------------------------------------------------------------------------
@@ -368,13 +494,101 @@ def build_bf16_variant(out_dir: pathlib.Path, *, skip_done: bool = True) -> None
     print(f"DONE: {out_dir}")
 
 
+def build_q_variant(
+    out_root: pathlib.Path,
+    *,
+    bits: int,
+    group_size: int = 64,
+    skip_done: bool = True,
+) -> None:
+    """Build the `LongCat-Video-q{bits}` variant by quantizing FROM the
+    already-converted bf16 variant on disk.
+
+    Layout: `{out_root}/LongCat-Video-q{bits}/`. Re-uses
+    `{out_root}/LongCat-Video-bf16/` as the quantization source — VAE /
+    umT5 / LoRAs are simply linked / re-copied bf16 (they're small enough
+    that quantizing them would degrade output more than save space).
+
+    The bf16 variant must exist at `{out_root}/LongCat-Video-bf16/`
+    before running this — build it first via `build_bf16_variant`.
+    """
+    bf16_dir = out_root / "LongCat-Video-bf16"
+    out_dir = out_root / f"LongCat-Video-q{bits}"
+    if not bf16_dir.exists():
+        raise FileNotFoundError(
+            f"bf16 variant not found at {bf16_dir}. Run "
+            f"`build_bf16_variant` first (or `--variant bf16`)."
+        )
+    print(f"Building q{bits} variant → {out_dir}")
+    print(f"  (quantizing from existing bf16 at {bf16_dir})")
+
+    # Re-use bf16 components verbatim. They're identical bytes; copy or
+    # link. We use copy here for portability (link would require the
+    # publish step to dereference; HF upload handles symlinks but local
+    # smoke tests are simpler with real files).
+    import shutil
+
+    def _copy_dir(name: str, sentinel: str):
+        src = bf16_dir / name
+        dst = out_dir / name
+        if skip_done and (dst / sentinel).exists():
+            print(f"  {name} already present — skipping copy")
+            return
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        print(f"  copied {name}/ from bf16 ({sum(p.stat().st_size for p in dst.rglob('*') if p.is_file()) / 1e9:.1f} GB)")
+
+    _copy_dir("vae", "diffusion_pytorch_model.safetensors")
+    _copy_dir("text_encoder", "model.safetensors.index.json")
+    _copy_dir("tokenizer", "tokenizer.json")
+    _copy_dir("scheduler", "scheduler_config.json")
+    _copy_dir("lora", "cfg_step_lora.safetensors")
+
+    # Quantize the DiT
+    if skip_done and _component_done(
+        out_dir, "dit", "diffusion_pytorch_model.safetensors.index.json",
+    ):
+        print(f"  DiT (q{bits}) already converted — skipping")
+    else:
+        quantize_dit_from_bf16(bf16_dir, out_dir, bits=bits, group_size=group_size)
+
+    write_pipeline_config(out_dir)
+    _write_quant_readme(out_dir, bits=bits)
+    print(f"DONE: {out_dir}")
+
+
+def _write_quant_readme(out_dir: pathlib.Path, *, bits: int) -> None:
+    """Stamp a minimal README pointing at the full model card on HF.
+    Full markdown lives in docs/model-cards/q{bits}.md; this is the
+    in-variant sentinel.
+    """
+    readme = f"""# LongCat-Video-q{bits} (MLX)
+
+{bits}-bit quantized variant of `mlx-community/LongCat-Video-bf16`. Same
+model, same six task variants — just with the DiT Linears quantized to
+{bits}-bit via `mlx.nn.quantize` for smaller-RAM Macs.
+
+See the longcat-video-mlx repo for the full model card and inference
+quick start. The runtime pipeline auto-detects the `quantization` block
+in `dit/config.json` and applies `nn.quantize` before loading weights.
+"""
+    (out_dir / "README.md").write_text(readme)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Convert LongCat-Video to MLX format (bf16)")
+    parser = argparse.ArgumentParser(description="Convert LongCat-Video to MLX format")
     parser.add_argument(
         "--out",
         type=pathlib.Path,
         required=True,
-        help="Output root directory. The bf16 variant subdir is created underneath.",
+        help="Output root directory. Per-variant subdirs are created underneath.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["bf16", "q4", "q8", "all"],
+        default="bf16",
+        help="Which variant(s) to build. 'all' builds bf16 then q4 then q8.",
     )
     parser.add_argument(
         "--skip-done",
@@ -383,7 +597,13 @@ def main():
         help="Skip components that already exist (resumable). Default: True.",
     )
     args = parser.parse_args()
-    build_bf16_variant(args.out / "LongCat-Video-bf16", skip_done=args.skip_done)
+
+    if args.variant in ("bf16", "all"):
+        build_bf16_variant(args.out / "LongCat-Video-bf16", skip_done=args.skip_done)
+    if args.variant in ("q4", "all"):
+        build_q_variant(args.out, bits=4, skip_done=args.skip_done)
+    if args.variant in ("q8", "all"):
+        build_q_variant(args.out, bits=8, skip_done=args.skip_done)
 
 
 if __name__ == "__main__":
