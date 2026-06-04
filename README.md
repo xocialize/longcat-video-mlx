@@ -1,21 +1,27 @@
 # longcat-video-mlx
 
 Apple MLX port of [LongCat-Video](https://github.com/meituan-longcat/LongCat-Video) —
-Meituan's 13.6B-parameter video diffusion model — for inference on Apple
+Meituan's 13.6 B-parameter video diffusion model — for inference on Apple
 Silicon (M-series).
 
-> **Status: scaffold.** Port plan tracked in [docs/development/](docs/development/).
+> **Status: alpha — bf16 weights published.** Converted bf16 weights live
+> at [mlx-community/LongCat-Video-bf16](https://huggingface.co/mlx-community/LongCat-Video-bf16)
+> (42 GB). Part of the [LongCat-Video — MLX](https://huggingface.co/collections/mlx-community/longcat-video-mlx-6a216a3576c098e83c1cc167)
+> collection. End-to-end T2V inference verified on real weights;
+> refinement (720p) + LoRA merge wiring remaining for a polished release.
+>
 > Companion repo [xocialize/longcat-avatar-mlx](https://github.com/xocialize/longcat-avatar-mlx)
-> ports the Avatar 1.5 variant of the same architecture and is production-
-> ready today — start there if you want audio-driven video generation now.
+> ports the Avatar 1.5 variant of the same architecture — start there
+> if you want audio-driven video generation.
 
 ## Six task variants, one DiT checkpoint
 
 | Variant | Pipeline | Status |
 |---|---|---|
-| **T2V** — text-to-video | `pipeline_t2v` | Pending (B1.3) |
-| **I2V** — image-to-video | `pipeline_i2v` | Pending (B2.1) |
-| **Video Continuation** | `pipeline_continuation` | Pending (B2.2) |
+| **T2V** — text-to-video | `pipeline_t2v` | ✅ shipped (B1.3 + B1.4 + golden smoke) |
+| **I2V** — image-to-video | `pipeline_i2v` | ✅ shipped (B2.1) |
+| **Video Continuation** | `pipeline_continuation` | ✅ shipped (B2.2) |
+| **720p / 30fps refinement** | `refinement.py` (+ BSA) | ✅ shipped (B3.1 + B3.2 Tier A) |
 | **Long-Video** (chained continuation) | `pipeline_long_video` | Pending (B5.1) |
 | **Interactive Video** (per-segment prompts) | `pipeline_interactive` | Pending (B5.2) |
 | Streamlit UI | — | Out of scope (use CLI) |
