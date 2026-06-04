@@ -1086,6 +1086,144 @@ for benchmark suites; under-applied for parity suites.
 
 ---
 
+## L49. `mx.fast.metal_kernel` input names shadow loop variables — avoid `k`, `v` as iteration variables `[toolkit candidate]`
+
+**What we hit:** Writing the Tier B BSA Metal kernel, I declared
+
+    for (uint k = 0; k < TK; k++) {
+        ...
+        dot += q_reg[d] * (float)k[k_base + d];
+
+`k` is both a `metal_kernel` input tensor AND my outer loop variable.
+Metal Shading Language compiler error: `subscripted value is not an array,
+pointer, or vector` — because inside the loop, `k` refers to the `uint`
+loop variable, not the input tensor pointer.
+
+**Rule for next port:** When writing `mx.fast.metal_kernel` source code,
+treat `input_names` like Python module names — avoid naming loop
+variables or local variables after them. Especially watch for
+`q`/`k`/`v`/`o` — the canonical attention tensor names that are also
+common iteration variables.
+
+**Workaround:** rename loop variables. We used `sel` for the
+"selected KV block" loop counter.
+
+**Skill update target:** add to `common-pitfalls.md` under
+"`mx.fast.metal_kernel` source-code gotchas." Tagged toolkit-candidate
+because this exact bug will recur in every custom kernel that imports
+named tensors.
+
+**Artifact:** `longcat_video/models/block_sparse_attention_metal.py`.
+
+---
+
+## L50. BSA token-block layout is NOT contiguous in t-major flat order `[toolkit candidate]`
+
+**What we hit:** Phase-1 Tier B kernel computed `q_block = s / block_size`
+to look up routing. **Wrong.** In the canonical (T, H, W) t-major flat
+layout, consecutive 64 tokens do NOT form a single BSA block. The BSA
+blocks are 4×4×4 voxels scattered across non-contiguous token indices.
+
+Concrete bug surface: with shape (T=8, H=8, W=8) latent and chunk_thw=
+(4, 4, 4):
+- Token (t=0, h=0, w=0) flat idx = 0, BSA block = (0, 0, 0) = 0
+- Token (t=0, h=4, w=0) flat idx = 32, BSA block = (0, 1, 0) = 2
+- Token (t=3, h=7, w=7) flat idx = 255, BSA block = (0, 1, 1) = 3
+
+So `s // 64` is NOT the block-of-token mapping. Tier A handles this by
+materializing a per-token block-index lookup table (`build_token_
+block_indices`); Tier B handles it by **pre-rearranging Q/K/V to
+block-major** so consecutive 64 tokens DO form a block (then unreshape
+the output back to t-major).
+
+Both produce the same result. Tier A's lookup table costs O(S) extra
+memory; Tier B's reshape avoids the extra index dependency in the kernel
+inner loop but costs O(S·D) data movement.
+
+**Rule for next port:** When porting block-sparse-attention to a custom
+kernel, decide **explicitly** how blocks map to seq-axis indices BEFORE
+writing the kernel. Two options:
+1. **Block-major layout**: pre-permute tokens so blocks are contiguous.
+   Cleanest in the kernel; data-movement overhead in the wrapper.
+2. **Lookup table**: pass `[S] int32 block_of_token` alongside Q/K/V.
+   Extra memory read per inner-loop iteration; no permute overhead.
+
+For our case option 1 won — the permute is free relative to the per-
+thread K/V reads.
+
+**Skill update target:** add to a new section in
+`attention-patterns.md` called "Block-sparse layouts" — the two-option
+fork above with trade-offs. Tagged toolkit-candidate because every BSA
+kernel hits this same fork.
+
+---
+
+## L51. Naive 1-thread-per-output-token Metal kernel is 2-7× SLOWER than `mx.fast.scaled_dot_product_attention`
+
+**What we hit:** Implemented BSA Tier B Phase 1 as the simplest correct
+kernel — one thread per output token, online softmax, fp32 accumulators,
+no threadgroup memory, no simdgroup_matrix. Result:
+
+| shape | dense SDPA | Tier B Phase 1 | B vs dense |
+|---|---|---|---|
+| S=384 | 0.28 ms | 0.61 ms | 0.46× |
+| S=2048 | 0.97 ms | 6.20 ms | **0.16×** |
+| S=3840 | 2.67 ms | 19.54 ms | **0.14×** |
+
+The kernel is **correct** (matches Tier A within 5e-3 fp16 tolerance)
+but Apple's `mx.fast.scaled_dot_product_attention` is using
+`simdgroup_matrix<fp16, 8, 8>` HW-accelerated matmul internally, and a
+single-threaded loop has no chance of beating that without HW
+acceleration.
+
+**Rule for next port:** Don't expect to beat `mx.fast.*` with a custom
+Metal kernel unless you're using `simdgroup_matrix` for the matmul
+portion. The 32× perf gap between "scalar fp32 accumulators in a loop"
+and "simdgroup_matrix HW matmul" is too large to make up with other
+optimizations.
+
+This doesn't mean naive kernels are useless — they're great for
+**custom logic** the `mx.fast.*` path can't express (sparse routing,
+custom masking, fused softmax variants). But the matmul part still
+needs HW acceleration.
+
+**Skill update target:** add to a new section in
+`custom-metal-kernels.md` (or `mlx-docs.md`) called "Performance
+ceilings for naive kernels." Cross-references the
+`simdgroup_matrix` API entry.
+
+**Artifact:** `docs/development/bsa-tier-b-design.md` Phase 1 results table.
+
+---
+
+## L52. `mx.fast.metal_kernel` first-call compile latency is ~0.5-2s — pre-warm at pipeline init
+
+**What we hit:** The first `bsa_attention_metal(...)` call took several
+seconds even with tiny inputs. Subsequent calls with the same
+template params were sub-millisecond. The cost is `metal_kernel` JIT
+compilation for that specific `(D, BS, TK, dtype)` template specialization.
+
+The DiT calls BSA from every block × every step × every inference call —
+production pattern is 48 layers × 25 steps × 1 inference = 1200 calls
+of the same kernel. The JIT cost amortizes to ~0.4 ms per call, but
+**the first call's user-visible latency is ~2 sec** — bad UX.
+
+Solution: pre-warm. Run the kernel ONCE on dummy inputs at pipeline
+initialization. We expose `prewarm_metal_kernel(head_dim, block_size,
+top_k_values, dtype)` for this. Call it inside
+`LongCatVideoTransformer3DModel.enable_bsa()` so the first refinement
+step doesn't pay the compile latency.
+
+**Rule for next port:** Any production kernel JITted via
+`mx.fast.metal_kernel` MUST be pre-warmed at pipeline init. Provide
+a `prewarm()` helper that takes the expected template-param ranges.
+
+**Skill update target:** add to `custom-metal-kernels.md` (new doc)
+or `repo-layout.md` under pipeline-init helpers. Cross-references the
+existing `mx.eval` discipline in `weight-conversion.md`.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -1101,7 +1239,7 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L48):**
+**Added in this port (L23–L52):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
@@ -1122,5 +1260,14 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
   single-GPU / CPU")
 - L48: Record parity BASELINE numbers, not just thresholds (regression
   detector that catches "still passing but 10,000× worse")
+- **L49: `metal_kernel` input names shadow loop variables** — avoid
+  `k`, `v` as iteration variables
+- **L50: BSA token-block layout is NOT contiguous in t-major flat order**
+  — pick block-major reshape OR lookup table BEFORE writing the kernel
+- L51: Naive 1-thread-per-output Metal kernel is 2-7× slower than
+  `mx.fast.scaled_dot_product_attention` (which uses simdgroup_matrix
+  HW accel) — don't expect to beat mx.fast without simdgroup_matrix
+- L52: `mx.fast.metal_kernel` first-call JIT is ~0.5-2s — provide
+  `prewarm()` and call it at pipeline init
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.
