@@ -65,13 +65,14 @@ def build_pipeline(
     height: int,
     width: int,
     with_cfg_step_lora: bool = False,
+    variant: str = "auto",
 ):
     from longcat_video.pipeline_interactive import (
         InteractivePipelineConfig,
         LongCatVideoInteractivePipeline,
     )
 
-    vae, umt5, dit, variant_dir = load_components(weights_dir)
+    vae, umt5, dit, variant_dir = load_components(weights_dir, variant=variant)
 
     cfg = InteractivePipelineConfig(
         num_frames_per_segment=num_frames_per_segment,
@@ -103,6 +104,8 @@ def main():
     parser = argparse.ArgumentParser(description="LongCat-Video Interactive inference")
     parser.add_argument("--weights", type=pathlib.Path, required=True,
                         help="Parent dir containing LongCat-Video-bf16/")
+    parser.add_argument("--variant", choices=["auto", "bf16", "q4", "q8"], default="auto",
+                        help="Which variant to load (default: auto — picks bf16 > q8 > q4)")
     grp = parser.add_mutually_exclusive_group(required=True)
     grp.add_argument("--prompts-file", type=pathlib.Path,
                      help="Path to a file with one prompt per line")
@@ -166,6 +169,7 @@ def main():
         args.weights, args.num_frames_per_segment, args.num_cond_frames,
         args.height, args.width,
         with_cfg_step_lora=args.cfg_step_lora,
+        variant=args.variant,
     )
     if args.num_steps:
         pipeline.t2v.config.num_sampling_steps = args.num_steps

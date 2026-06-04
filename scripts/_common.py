@@ -24,21 +24,101 @@ import numpy as np
 
 # -------------------- Model loading --------------------------------------
 
-def load_components(weights_dir: pathlib.Path):
-    """Load all three components (VAE, umT5, DiT) from the converted bf16
-    directory layout produced by `recipes/convert_longcat_video.py`.
+VARIANT_DIRNAMES: dict[str, str] = {
+    "bf16": "LongCat-Video-bf16",
+    "q4": "LongCat-Video-q4",
+    "q8": "LongCat-Video-q8",
+}
+
+
+def _apply_quantization_for_load(dit, quant_cfg: dict) -> None:
+    """Apply `mlx.nn.quantize` to a freshly-constructed DiT *before*
+    loading quantized weights — required so `QuantizedLinear` modules
+    are installed at the matching paths before the bit-packed
+    `weight`/`scales`/`biases` tensors land via `load_weights`.
+
+    The skip rule must match the conversion recipe; we duplicate it
+    inline rather than import to keep the runtime free of conversion-
+    time dependencies (huggingface_hub, etc).
+    """
+    import mlx.nn as nn
+
+    skip_patterns: list[str] = quant_cfg.get(
+        "skip_patterns",
+        [
+            "final_layer.linear",
+            "t_embedder.",
+            "y_embedder.",
+            "adaLN_modulation.",
+        ],
+    )
+
+    def predicate(path: str, module) -> bool:
+        if not isinstance(module, nn.Linear):
+            return False
+        for pat in skip_patterns:
+            if pat in path:
+                return False
+        return True
+
+    nn.quantize(
+        dit,
+        group_size=int(quant_cfg.get("group_size", 64)),
+        bits=int(quant_cfg["bits"]),
+        class_predicate=predicate,
+    )
+
+
+def _resolve_variant(weights_dir: pathlib.Path, variant: str) -> pathlib.Path:
+    """Resolve `weights_dir/{variant_subdir}/`. Variant 'auto' picks the
+    first existing variant in preference order: bf16 → q8 → q4.
+    """
+    if variant == "auto":
+        for v in ("bf16", "q8", "q4"):
+            candidate = weights_dir / VARIANT_DIRNAMES[v]
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(
+            f"No LongCat-Video variant found under {weights_dir}. "
+            f"Tried: {list(VARIANT_DIRNAMES.values())}"
+        )
+    if variant not in VARIANT_DIRNAMES:
+        raise ValueError(
+            f"Unknown variant {variant!r}. Choose from "
+            f"{list(VARIANT_DIRNAMES) + ['auto']}"
+        )
+    return weights_dir / VARIANT_DIRNAMES[variant]
+
+
+def load_components(
+    weights_dir: pathlib.Path,
+    variant: str = "auto",
+):
+    """Load all three components (VAE, umT5, DiT) from a converted
+    `LongCat-Video-{variant}/` directory produced by
+    `recipes/convert_longcat_video.py`.
+
+    Args:
+        weights_dir: parent directory containing one or more variant subdirs.
+        variant: "bf16", "q4", "q8", or "auto" (default — picks first existing
+            in preference order bf16 > q8 > q4).
 
     Returns `(vae, umt5, dit, variant_dir)`. The caller wires them into
     whichever pipeline (T2V / I2V / Continuation / Refinement).
+
+    Quantized variants are detected via the `quantization` block in
+    `dit/config.json` — `mlx.nn.quantize` is applied to the DiT *before*
+    `load_weights` so the QuantizedLinear modules are installed at the
+    right paths to receive the bit-packed tensors.
     """
     from longcat_video.models.autoencoder_kl_wan import AutoencoderKLWan
     from longcat_video.models.longcat_video_dit import LongCatVideoTransformer3DModel
     from longcat_video.models.umt5 import UMT5EncoderModel
 
-    variant_dir = weights_dir / "LongCat-Video-bf16"
+    variant_dir = _resolve_variant(weights_dir, variant)
     print(f"Loading from {variant_dir}")
 
-    # VAE — single file
+    # VAE — single file (always bf16 across all variants)
     vae_cfg = json.loads((variant_dir / "vae" / "config.json").read_text())
     vae = AutoencoderKLWan.from_config(vae_cfg)
     vae.load_weights(
@@ -46,7 +126,7 @@ def load_components(weights_dir: pathlib.Path):
         strict=False,
     )
 
-    # umT5 (sharded)
+    # umT5 (sharded, always bf16)
     umt5_cfg = json.loads((variant_dir / "text_encoder" / "config.json").read_text())
     umt5 = UMT5EncoderModel.from_config(umt5_cfg)
     umt5_idx = json.loads(
@@ -57,9 +137,18 @@ def load_components(weights_dir: pathlib.Path):
             str(variant_dir / "text_encoder" / shard_name), strict=False,
         )
 
-    # DiT (sharded)
+    # DiT (sharded; bf16 OR quantized depending on the variant's config)
     dit_cfg = json.loads((variant_dir / "dit" / "config.json").read_text())
+    quant_cfg = dit_cfg.get("quantization")
     dit = LongCatVideoTransformer3DModel.from_config(dit_cfg)
+    if quant_cfg is not None:
+        print(
+            f"  DiT quantization detected: {quant_cfg['bits']}-bit, "
+            f"group_size={quant_cfg.get('group_size', 64)}, "
+            f"skipping {len(quant_cfg.get('skip_patterns', []))} pattern(s) "
+            f"— applying nn.quantize before load_weights"
+        )
+        _apply_quantization_for_load(dit, quant_cfg)
     dit_idx = json.loads(
         (variant_dir / "dit" / "diffusion_pytorch_model.safetensors.index.json").read_text()
     )

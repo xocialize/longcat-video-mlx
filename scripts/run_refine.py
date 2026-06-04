@@ -68,6 +68,7 @@ def build_pipeline(
     target_height: int,
     target_width: int,
     spatial_only: bool,
+    variant: str = "auto",
 ):
     """Load components, hot-swap refinement_lora, enable BSA, wire pipeline."""
     from longcat_video.refinement import (
@@ -75,7 +76,7 @@ def build_pipeline(
         RefinementPipelineConfig,
     )
 
-    vae, umt5, dit, variant_dir = load_components(weights_dir)
+    vae, umt5, dit, variant_dir = load_components(weights_dir, variant=variant)
 
     # Hot-swap refinement_lora into the DiT module tree
     merge_lora(dit, variant_dir, "refinement_lora")
@@ -105,6 +106,8 @@ def main():
     parser = argparse.ArgumentParser(description="LongCat-Video Refinement inference")
     parser.add_argument("--weights", type=pathlib.Path, required=True,
                         help="Parent dir containing LongCat-Video-bf16/")
+    parser.add_argument("--variant", choices=["auto", "bf16", "q4", "q8"], default="auto",
+                        help="Which variant to load (default: auto — picks bf16 > q8 > q4)")
     parser.add_argument("--stage1", type=pathlib.Path, required=True,
                         help="Coarse video: .npy [T, H, W, 3] uint8 or .mp4")
     parser.add_argument("--prompt", required=True,
@@ -135,6 +138,7 @@ def main():
     t0 = time.time()
     pipeline, cfg, variant_dir = build_pipeline(
         args.weights, args.target_height, args.target_width, args.spatial_only,
+        variant=args.variant,
     )
     pipeline.config.num_sampling_steps = args.num_steps
     print(f"  pipeline loaded in {time.time() - t0:.1f}s")

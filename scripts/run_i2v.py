@@ -40,11 +40,15 @@ from _common import (
 )
 
 
-def build_pipeline(weights_dir: pathlib.Path, with_cfg_step_lora: bool):
+def build_pipeline(
+    weights_dir: pathlib.Path,
+    with_cfg_step_lora: bool,
+    variant: str = "auto",
+):
     """Load components + wire the I2V pipeline."""
     from longcat_video.pipeline_i2v import I2VPipelineConfig, LongCatVideoI2VPipeline
 
-    vae, umt5, dit, variant_dir = load_components(weights_dir)
+    vae, umt5, dit, variant_dir = load_components(weights_dir, variant=variant)
 
     cfg = I2VPipelineConfig()
     pipeline = LongCatVideoI2VPipeline(
@@ -67,6 +71,8 @@ def main():
     parser = argparse.ArgumentParser(description="LongCat-Video I2V inference")
     parser.add_argument("--weights", type=pathlib.Path, required=True,
                         help="Parent dir containing LongCat-Video-bf16/")
+    parser.add_argument("--variant", choices=["auto", "bf16", "q4", "q8"], default="auto",
+                        help="Which variant to load (default: auto — picks bf16 > q8 > q4)")
     parser.add_argument("--image", type=pathlib.Path, required=True,
                         help="Path to reference image (motion anchor)")
     parser.add_argument("--prompt", required=True,
@@ -93,6 +99,7 @@ def main():
     t0 = time.time()
     pipeline, cfg, variant_dir = build_pipeline(
         args.weights, with_cfg_step_lora=args.cfg_step_lora,
+        variant=args.variant,
     )
     if args.num_steps:
         pipeline.config.num_sampling_steps = args.num_steps
