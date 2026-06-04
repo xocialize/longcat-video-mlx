@@ -1311,6 +1311,94 @@ guaranteed to save days of misdirected design.
 
 ---
 
+## L55. Threadgroup-shared K+V eliminates the cross-simdgroup load redundancy in BSA `[toolkit candidate]`
+
+**What we hit:** Phase 2 had 1 simdgroup per output token. For 64 Q
+tokens in the same BSA block all attending to the SAME selected KV
+blocks, each of 8 simdgroups was independently re-reading the same
+K/V data from global memory. That's 8× redundant global reads of every
+attended KV token.
+
+Phase 3 changes the dispatch: 1 threadgroup = 1 Q block (64 tokens),
+8 simdgroups per threadgroup, **K + V both cooperatively loaded into
+32 KB threadgroup shared memory ONCE per KV block**, then all 8
+simdgroups consume from shared.
+
+Result: **2.0-2.3× faster than dense SDPA at large shapes** (S≥8K),
+vs Phase 2's 1.2× — the cross-simdgroup redundancy was the bottleneck.
+
+**Rule for next port:** Any "per-token independent attention" kernel
+where the per-token attention sets ARE actually shared across the
+threadgroup's Q tokens — share K and V through threadgroup memory.
+Specifically:
+
+- Phase 2 pattern: 1 simdgroup = 1 output token. Works when each Q
+  token attends to a completely different set of KVs.
+- Phase 3 pattern: 1 threadgroup = N Q tokens that share the same KV
+  routing. Cooperative load → shared K+V tiles → fanned-out compute
+  across N simdgroups.
+
+BSA's design (1 Q block × top_k KV blocks routing) is exactly the
+Phase 3 case. Every Q token in the same Q block sees the same KV blocks.
+
+Constraint: K_smem + V_smem must fit in the threadgroup memory budget
+(32 KB on M-series M1/M2; 64 KB on M3+). For BSA with block_size=64,
+D=128 fp16: 2 × 64 × 128 × 2 = 32 KB — exactly at the M-series limit.
+Larger D needs tiled streaming or M3+.
+
+**Skill update target:** add to `custom-metal-kernels.md` as the
+"when to introduce threadgroup-shared K/V" rule. Tagged toolkit-
+candidate because the dispatch pattern (Q block → threadgroup, multiple
+simdgroups per group) generalizes to every sparse-attention kernel
+where Q tokens share routing decisions.
+
+**Artifact:** `_BSA_KERNEL_V3_BODY` in
+`longcat_video/models/block_sparse_attention_metal.py`.
+
+---
+
+## L56. Auto-select kernel by sequence length at the dispatcher boundary `[toolkit candidate]`
+
+**What we hit:** Phase 3 (threadgroup-shared K+V) wins big at large S
+but has overhead at small S (per-threadgroup setup, K+V cooperative
+loads). Phase 2 (single-simdgroup-per-token) is faster at small S
+because of its simpler dispatch. Neither wins everywhere.
+
+Solution: **auto-select at the dispatcher boundary** (inside the
+attention wrapper, NOT in the kernel itself):
+
+```python
+S = int(q.shape[-2])
+use_v3 = (S >= 1280 and BS == 64 and D % 32 == 0
+          and 2 * BS * D * dtype_size <= 32 * 1024)
+if use_v3:
+    return bsa_kernel_v3(q, k, v, block_indices, ...)
+return bsa_kernel_v2(q, k, v, block_indices, ...)
+```
+
+This gives users a single `enable_bsa(backend="metal")` knob that "does
+the right thing" while still exposing `metal_v2` / `metal_v3` for
+explicit override during benchmarking.
+
+The crossover threshold (S=1280 here) was found empirically — see
+`bsa-tier-b-design.md`'s benchmark table. Don't pick a threshold from
+theory; measure it.
+
+**Rule for next port:** When you have multiple correct implementations
+with different perf characteristics, expose ALL of them explicitly
+(`metal_v2`, `metal_v3`) AND provide an auto-selecting default
+(`metal`). The auto-selector should use a measured crossover, with
+the explicit variants as escape hatches when the heuristic is wrong
+for a given workload.
+
+**Skill update target:** add to `repo-layout.md` under "Multi-variant
+kernel dispatch." Tagged toolkit-candidate.
+
+**Artifact:** `Attention._process_attn()` in `longcat_video/models/
+attention.py`.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -1326,7 +1414,7 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L54):**
+**Added in this port (L23–L56):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
@@ -1360,5 +1448,12 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - **L54: Read MLX's `*.h` source kernels BEFORE designing your own** —
   the simpler non-steel variants (sdpa_vector.h, etc.) translate
   cleanly to JIT kernels
+- **L55: Threadgroup-shared K+V eliminates cross-simdgroup load
+  redundancy** in BSA — Phase 3 pattern (1 threadgroup = 1 Q block,
+  multiple simdgroups share KV tiles). 2-2.3× faster than dense at
+  S≥8K vs Phase 2's 1.2×
+- **L56: Auto-select kernel by sequence length at the dispatcher
+  boundary** — expose all variants explicitly, provide auto-selecting
+  default, use measured (not theoretical) crossover
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.

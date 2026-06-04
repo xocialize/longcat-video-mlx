@@ -60,12 +60,14 @@ import mlx.core as mx
 __all__ = [
     "bsa_attention_metal",
     "bsa_attention_metal_v2",
+    "bsa_attention_metal_v3",
     "prewarm_metal_kernel",
 ]
 
 
 _KERNEL_CACHE: dict[tuple, object] = {}
 _KERNEL_V2_CACHE: dict[tuple, object] = {}
+_KERNEL_V3_CACHE: dict[tuple, object] = {}
 
 
 _BSA_KERNEL_BODY = r"""
@@ -526,6 +528,268 @@ def bsa_attention_metal_v2(
     grid_x = B * H * S * 32
     grid = (grid_x, 1, 1)
     threadgroup = (32, 1, 1)
+
+    out_bm = kernel(
+        inputs=[q_bm, k_bm, v_bm, block_indices],
+        template=[
+            ("T", q.dtype),
+            ("D", D),
+            ("BS", BS),
+            ("TK", TK),
+        ],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(B, H, S, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+
+    return _reshape_from_block_major(out_bm, shape, chunk_thw)
+
+
+# ===========================================================================
+# Phase 3 — threadgroup-shared K + V (FASTER)
+# ===========================================================================
+#
+# Phase 2 had 1 simdgroup per output token; each Q token's simdgroup
+# independently read K/V from global memory. For 64 Q tokens in the same
+# BSA block all attending to the SAME selected KV blocks, that's 64×
+# redundant K/V reads.
+#
+# Phase 3 changes the dispatch:
+#   - 1 threadgroup = 1 Q block (64 Q tokens)
+#   - 8 simdgroups per threadgroup; each handles 8 Q tokens
+#   - K + V cooperatively loaded into 32 KB threadgroup-shared memory
+#     ONCE per KV block; all 8 simdgroups reuse the same shared K/V
+#   - Q in registers (per-thread, distributed across simdgroup)
+#   - Per-thread state: 8 Q tokens × QK_PT slice of Q/output
+#
+# This eliminates the 64× redundant global K/V reads of Phase 2 and
+# replaces them with one cooperative shared-memory load per KV block.
+# The dominant cost should shift from memory bandwidth to compute.
+
+_BSA_KERNEL_V3_BODY = r"""
+    // ===================================================================
+    // BSA Tier B Phase-3 threadgroup-shared K + V kernel.
+    //
+    // Threading:
+    //   grid:        (B * H * num_q_blocks, 1, 1)
+    //   threadgroup: (256, 1, 1) = 8 simdgroups
+    //   → one threadgroup = one Q block (64 Q tokens)
+    //
+    // Shared memory layout:
+    //   K_smem[BS * D]: 16 KB for BS=64, D=128, fp16
+    //   V_smem[BS * D]: 16 KB for BS=64, D=128, fp16
+    //   Total: 32 KB (Apple Silicon M-series threadgroup memory limit)
+    //
+    // Each simdgroup handles QPSG = BS / NSG = 64 / 8 = 8 Q tokens.
+    // ===================================================================
+
+    constexpr uint BD = 32;          // simdgroup width
+    constexpr uint NSG = 8;          // simdgroups per threadgroup
+    constexpr uint QPSG = BS / NSG;  // Q tokens per simdgroup = 8
+    constexpr uint QK_PT = D / BD;   // QK elements per thread = 4 (D=128)
+    constexpr uint TG_SIZE = NSG * BD;  // total threads/group = 256
+    constexpr uint TILE_BYTES = BS * D;  // elements per shared tile (K or V)
+
+    uint tg_lid = thread_position_in_threadgroup.x;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+
+    uint linear_tg = threadgroup_position_in_grid.x;
+    uint S = q_shape[2];
+    uint H = q_shape[1];
+    uint B = q_shape[0];
+    uint num_q_blocks = S / BS;
+
+    // Decode (b, h, q_block) from threadgroup id
+    uint b = linear_tg / (H * num_q_blocks);
+    uint hq = linear_tg % (H * num_q_blocks);
+    uint h = hq / num_q_blocks;
+    uint q_block = hq % num_q_blocks;
+
+    // 1. Load Q into per-thread registers.
+    // Each simdgroup handles QPSG=8 Q tokens. Q token in this Q block:
+    //   q_token_local = simd_gid * QPSG + i   for i in 0..QPSG
+    // Each thread holds QK_PT=4 elements per Q token, indexed by simd_lid.
+    float q_reg[QPSG][QK_PT];
+    uint q_block_base = ((b * H + h) * S + q_block * BS) * D;
+    for (uint i = 0; i < QPSG; i++) {
+        uint q_token_local = simd_gid * QPSG + i;
+        for (uint d = 0; d < QK_PT; d++) {
+            q_reg[i][d] = (float)q[q_block_base + q_token_local * D
+                                   + simd_lid * QK_PT + d];
+        }
+    }
+
+    // 2. Initialize per-Q-token softmax state in registers.
+    float max_score[QPSG];
+    float sum_score[QPSG];
+    float o_reg[QPSG][QK_PT];
+    for (uint i = 0; i < QPSG; i++) {
+        max_score[i] = -INFINITY;
+        sum_score[i] = 0.0f;
+        for (uint d = 0; d < QK_PT; d++) o_reg[i][d] = 0.0f;
+    }
+
+    const float scale = 1.0f / metal::sqrt((float)D);
+    const float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+
+    // 3. Shared memory for K and V tiles
+    threadgroup T K_smem[TILE_BYTES];
+    threadgroup T V_smem[TILE_BYTES];
+
+    // 4. Loop over selected KV blocks (TK iterations)
+    uint bi_base = ((b * H + h) * num_q_blocks + q_block) * TK;
+    for (uint sel = 0; sel < TK; sel++) {
+        int kv_block_idx = block_indices[bi_base + sel];
+        uint kv_token_base = (uint)kv_block_idx * BS;
+        uint kv_block_global = ((b * H + h) * S + kv_token_base) * D;
+
+        // 4a. Cooperatively load K and V into shared
+        // TG_SIZE=256 threads divide TILE_BYTES=8192 (for D=128) → 32 per thread.
+        for (uint e = tg_lid; e < TILE_BYTES; e += TG_SIZE) {
+            K_smem[e] = k[kv_block_global + e];
+            V_smem[e] = v[kv_block_global + e];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 4b. For each K token in the block
+        for (uint j = 0; j < BS; j++) {
+            uint kv_idx = kv_token_base + j;
+            if (kv_idx >= S) break;
+
+            // Compute scores for all QPSG=8 of MY simdgroup's Q tokens.
+            // Each thread computes its slice's dot product; simd_sum reduces
+            // across the 32 threads to one scalar score per Q token.
+            float scores[QPSG];
+            for (uint i = 0; i < QPSG; i++) {
+                float local_dot = 0.0f;
+                for (uint d = 0; d < QK_PT; d++) {
+                    float k_val = (float)K_smem[j * D + simd_lid * QK_PT + d];
+                    local_dot += q_reg[i][d] * k_val;
+                }
+                scores[i] = metal::simd_sum(local_dot) * scale_log2;
+            }
+
+            // Read V[j] from shared (each thread its QK_PT slice). One read
+            // per K token per thread — V_smem amortizes across all 8
+            // simdgroups in the threadgroup (no global redundancy).
+            float v_local[QK_PT];
+            for (uint d = 0; d < QK_PT; d++) {
+                v_local[d] = (float)V_smem[j * D + simd_lid * QK_PT + d];
+            }
+
+            // Online softmax + output update per Q token
+            for (uint i = 0; i < QPSG; i++) {
+                float m_new = metal::max(max_score[i], scores[i]);
+                float exp_diff = metal::fast::exp2(max_score[i] - m_new);
+                float exp_score = metal::fast::exp2(scores[i] - m_new);
+                sum_score[i] = sum_score[i] * exp_diff + exp_score;
+                for (uint d = 0; d < QK_PT; d++) {
+                    o_reg[i][d] = o_reg[i][d] * exp_diff + exp_score * v_local[d];
+                }
+                max_score[i] = m_new;
+            }
+        }
+        // Wait for all simdgroups before reloading shared K/V
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 5. Normalize + write output
+    for (uint i = 0; i < QPSG; i++) {
+        uint q_token_local = simd_gid * QPSG + i;
+        uint q_global = q_block * BS + q_token_local;
+        if (q_global >= S) continue;
+        float inv_l = (sum_score[i] > 0.0f) ? (1.0f / sum_score[i]) : 0.0f;
+        uint out_base = ((b * H + h) * S + q_global) * D;
+        for (uint d = 0; d < QK_PT; d++) {
+            out[out_base + simd_lid * QK_PT + d] = (T)(o_reg[i][d] * inv_l);
+        }
+    }
+"""
+
+
+def _get_kernel_v3(D: int, BS: int, TK: int, dtype: mx.Dtype):
+    """JIT-compile the Phase 3 kernel (cached)."""
+    key = (D, BS, TK, dtype)
+    if key not in _KERNEL_V3_CACHE:
+        _KERNEL_V3_CACHE[key] = mx.fast.metal_kernel(
+            name=f"bsa_phase3_D{D}_BS{BS}_TK{TK}",
+            input_names=["q", "k", "v", "block_indices"],
+            output_names=["out"],
+            source=_BSA_KERNEL_V3_BODY,
+            ensure_row_contiguous=True,
+        )
+    return _KERNEL_V3_CACHE[key]
+
+
+def bsa_attention_metal_v3(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    block_indices: mx.array,
+    chunk_thw: tuple[int, int, int] = (4, 4, 4),
+    shape: Optional[tuple[int, int, int]] = None,
+) -> mx.array:
+    """BSA Tier B Phase 3 — threadgroup-shared K+V Metal kernel.
+
+    Same interface as Phase 2 but eliminates the across-simdgroup K/V
+    redundancy by sharing the loaded KV block across 8 simdgroups in
+    each threadgroup. Each threadgroup handles one full Q block (64
+    tokens), and the 8 simdgroups within share the K and V tiles from
+    32 KB threadgroup memory.
+
+    Constraints (in addition to Phase 2's):
+    - block_size (= chunk_thw[0]*chunk_thw[1]*chunk_thw[2]) must be 64
+      (the kernel's NSG=8 simdgroups × QPSG=8 Q tokens = 64)
+    - For D=128 fp16: K_smem + V_smem = 32 KB. Apple Silicon M-series
+      threadgroup memory limit is 32 KB. For larger D, will need
+      a smaller tile or fall back to Phase 2.
+    """
+    if shape is None:
+        raise ValueError(
+            "shape=(T_lat, H_lat, W_lat) is required for Tier B BSA"
+        )
+    B, H, S, D = q.shape
+    BS = chunk_thw[0] * chunk_thw[1] * chunk_thw[2]
+    TK = int(block_indices.shape[-1])
+
+    if S % BS != 0:
+        raise ValueError(f"S={S} must be a multiple of block_size={BS}.")
+    if BS != 64:
+        raise ValueError(
+            f"Phase 3 currently requires block_size=64, got {BS}. "
+            f"Use Phase 2 (bsa_attention_metal_v2) for other block sizes."
+        )
+    if D % 32 != 0:
+        raise ValueError(
+            f"head_dim D={D} must be a multiple of 32 (simdgroup width)."
+        )
+    # Threadgroup memory budget check: K_smem + V_smem = 2 * BS * D * sizeof(T)
+    dtype_size = 2 if q.dtype in (mx.float16, mx.bfloat16) else 4
+    tg_mem_bytes = 2 * BS * D * dtype_size
+    if tg_mem_bytes > 32 * 1024:
+        raise ValueError(
+            f"Phase 3 K+V shared memory {tg_mem_bytes / 1024:.0f} KB exceeds "
+            f"32 KB Apple Silicon M-series threadgroup memory limit. "
+            f"D={D}, fp{8*dtype_size}. Use Phase 2 instead."
+        )
+
+    # Rearrange t-major → block-major for kernel's block-contiguous layout
+    q_bm = _reshape_to_block_major(q, shape, chunk_thw)
+    k_bm = _reshape_to_block_major(k, shape, chunk_thw)
+    v_bm = _reshape_to_block_major(v, shape, chunk_thw)
+
+    kernel = _get_kernel_v3(D, BS, TK, q.dtype)
+
+    if block_indices.dtype != mx.int32:
+        block_indices = block_indices.astype(mx.int32)
+
+    # Dispatch: one threadgroup per Q block, 256 threads per threadgroup
+    num_q_blocks = S // BS
+    grid = (B * H * num_q_blocks * 256, 1, 1)
+    threadgroup = (256, 1, 1)
 
     out_bm = kernel(
         inputs=[q_bm, k_bm, v_bm, block_indices],

@@ -221,19 +221,31 @@ class LongCatVideoTransformer3DModel(nn.Module):
         """Turn on Block Sparse Attention across all 48 DiT blocks.
 
         Args:
-            backend: "tier_a" (default, pure-MLX reference; safest fallback
-                     semantics) or "metal" (Phase 2 simdgroup-cooperative
-                     kernel — 1.2-1.35× faster than dense SDPA at large S).
+            backend: BSA implementation to use:
+                - "tier_a"   — pure-MLX reference (default; safest fallback)
+                - "metal"    — auto-selecting Metal kernel: Phase 3
+                  (threadgroup-shared K+V) at S≥1280 where block_size=64
+                  and D%32==0 and shared-mem fits 32 KB; Phase 2 otherwise.
+                  Best wall-clock at production refinement shapes.
+                - "metal_v2" — explicit Phase 2 (simdgroup-cooperative)
+                - "metal_v3" — explicit Phase 3 (threadgroup-shared K+V)
 
         Used by the refinement pipeline before the 720p denoise loop.
         BSA params are read from the published config's `bsa_params`
         block (preserved on the instance by `from_config`).
 
-        See `models/block_sparse_attention.py` for Tier A;
-        `block_sparse_attention_metal.py` for Tier B Phase 2.
+        Benchmark (fp16 sparsity=0.9375, single forward pass):
+
+        | shape | dense | Phase 2 | Phase 3 |
+        |---|---|---|---|
+        | S=384 | 0.34 ms | 0.51 ms | 0.98 ms (overhead) |
+        | S=2048 | 2.43 ms | 2.72 ms | 2.35 ms |
+        | S=8192 | 38.5 ms | 34.3 ms | **17.2 ms** (2.23× dense) |
+        | S=12800 | 75.3 ms | 63.5 ms | **36.2 ms** (2.08× dense) |
         """
-        assert backend in ("tier_a", "metal"), (
-            f"unknown BSA backend: {backend!r}. Choose 'tier_a' or 'metal'."
+        valid = ("tier_a", "metal", "metal_v2", "metal_v3")
+        assert backend in valid, (
+            f"unknown BSA backend: {backend!r}. Choose from {valid}"
         )
         for block in self.blocks:
             block.attn.enable_bsa = True
