@@ -150,7 +150,12 @@ class LongCatVideoT2VPipeline:
         cond pass and skips the (cond - uncond) correction.
         """
         if self.config.cfg_collapse:
-            # cfg_step_lora has absorbed the CFG correction — single pass
+            # cfg_step_lora has absorbed the CFG correction — single pass.
+            # Normalize scalar timestep to [B=1] just like the 2-pass branch
+            # does, otherwise the DiT's `timestep.ndim == 1` broadcast check
+            # is skipped and downstream reshape mangles the embedding dim.
+            if timestep.ndim == 0:
+                timestep = timestep[None]
             pred = self.dit(
                 latents, timestep, text_embeds_cat[1:2],  # positive half only
                 encoder_attention_mask=text_mask_cat[1:2],

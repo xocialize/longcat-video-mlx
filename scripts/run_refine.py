@@ -40,6 +40,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from _common import (
     encode_prompts,
     load_components,
+    merge_lora,
     postprocess_video,
     save_video_mp4,
 )
@@ -62,37 +63,6 @@ def load_stage1(path: pathlib.Path, fallback_fps: int = 15) -> tuple[np.ndarray,
     return arr, fallback_fps
 
 
-def hot_swap_refinement_lora(dit, lora_path: pathlib.Path) -> int:
-    """Merge `refinement_lora` into the DiT in-place.
-
-    Returns the count of modules touched. Uses the same group / merge
-    logic as the Avatar port's `merge_dmd_lora` helper.
-    """
-    from safetensors import safe_open
-
-    from longcat_video.lora import compute_merged_delta, group_lora_tensors
-
-    if not lora_path.exists():
-        raise FileNotFoundError(
-            f"refinement_lora not found at {lora_path}. Run the conversion "
-            "recipe first: `python -m recipes.convert_longcat_video --out <PATH>`"
-        )
-
-    lora_sd = {}
-    with safe_open(str(lora_path), framework="numpy") as f:
-        for k in f.keys():
-            lora_sd[k] = mx.array(f.get_tensor(k))
-
-    grouped = group_lora_tensors(lora_sd)
-    # Per-module: walk dit.parameters() to find the base weight and add delta.
-    # For now we count the identified modules; the actual merge into the
-    # MLX DiT module tree is the same wiring deferred from B1.4 (lands in
-    # B1.5 — single helper covers both cfg_step_lora and refinement_lora).
-    print(f"  [refinement_lora] identified {len(grouped)} target modules. "
-          "Merge wiring shared with cfg_step_lora — lands in B1.5.")
-    return len(grouped)
-
-
 def build_pipeline(
     weights_dir: pathlib.Path,
     target_height: int,
@@ -107,9 +77,8 @@ def build_pipeline(
 
     vae, umt5, dit, variant_dir = load_components(weights_dir)
 
-    # Hot-swap refinement_lora
-    lora_path = variant_dir / "lora" / "refinement_lora.safetensors"
-    hot_swap_refinement_lora(dit, lora_path)
+    # Hot-swap refinement_lora into the DiT module tree
+    merge_lora(dit, variant_dir, "refinement_lora")
 
     # Enable BSA across all 48 DiT blocks (B3.2 Tier A pure-MLX
     # reference; Tier B Metal kernel lands in B4.1).

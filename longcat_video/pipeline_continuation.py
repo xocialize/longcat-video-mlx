@@ -124,6 +124,9 @@ class LongCatVideoContinuationPipeline:
     ) -> mx.array:
         """One CFG step with conditioning latents at the head."""
         if self.config.cfg_collapse:
+            # See pipeline_t2v._cfg_forward — same ndim==0 normalization.
+            if timestep.ndim == 0:
+                timestep = timestep[None]
             pred = self.dit(
                 latents, timestep, text_embeds_cat[1:2],
                 encoder_attention_mask=text_mask_cat[1:2],

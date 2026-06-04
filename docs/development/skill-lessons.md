@@ -595,6 +595,211 @@ are the recovery mechanism).
 
 ---
 
+## L39. LoRA merge wrapper must FAIL LOUDLY when 0 modules match `[toolkit candidate]`
+
+**What we hit:** When wiring `cfg_step_lora` and `refinement_lora` into
+the 5 CLIs, we built a thin `merge_lora(dit, variant_dir, name)` wrapper
+around the existing `merge_lora_into_model`. The underlying merge already
+returns `{"applied": [...], "unmapped": [...]}` lists, but if the LoRA
+key encoding was even slightly off (e.g. a future LoRA uses a different
+separator), the function would happily return `{"applied": [],
+"unmapped": [all_paths]}` and **the inference would silently run with
+the base model** — producing wrong output that looks like a slow-quality
+issue but is actually a no-op merge.
+
+Avoid this by asserting in the wrapper:
+
+```python
+result = merge_lora_into_model(dit, sd, multiplier=multiplier)
+n_applied = len(result["applied"])
+assert n_applied > 0, (
+    f"{name}: 0 modules merged — LoRA target paths don't match the "
+    f"DiT module tree. A no-op merge would silently produce wrong "
+    f"output, so failing loudly. Check lora.decode_module_name's "
+    f"output against dict(tree_flatten(dit.parameters())).keys()."
+)
+```
+
+**Rule for next port:** Any "merge weight delta into model" helper —
+LoRA, LyCORIS, low-rank adapters, peft-style overlays — must fail loudly
+when the merge is a no-op. The wrapper layer (CLI / orchestration) is
+the right place to enforce it: the underlying merge math has no
+business deciding whether 0 applications is an error. Treat the
+**absence of effect** as a bug, not as silence.
+
+This is L24's principle (degenerate-case correctness gate) applied to
+the *operational* layer: instead of testing the algorithm reduces to
+something known-good, test that the *side effect* the caller asked for
+actually happened.
+
+**Skill update target:** add to `common-pitfalls.md` under
+"Silent side-effect failures" — same family as the `mx.eval` before
+`mx.save_safetensors` defense (zero-tensor save trap from L11 in Avatar
+context). Tagged toolkit-candidate because the pattern (assert>0 in
+the wrapper, not the math) generalizes to every "patch into module
+tree" helper across MLX ports.
+
+**Artifact:** `scripts/_common.py::merge_lora` +
+`tests/smoke/test_lora_merge_wrapper_smoke.py`.
+
+---
+
+## L40. Free the LoRA state dict immediately after merge
+
+**What we hit:** Pre-merging `cfg_step_lora` (2.3 GB) and
+`refinement_lora` (3.0 GB) into the DiT — the LoRA state dict is loaded
+as a Python dict of `mx.array`s totaling ~3 GB. After
+`merge_lora_into_model` has finished, those tensors are *redundant*: the
+delta is already in the DiT weights. But the state dict stays
+referenced in the calling scope until garbage collection runs.
+
+For inference at 480p the spare 3 GB is fine; for refinement at 720p
+with BSA on (which materializes the full S² mask per layer × 48 layers),
+unified memory is *much* tighter and a held 3 GB LoRA state dict can
+push us over.
+
+Drop it explicitly:
+
+```python
+result = merge_lora_into_model(dit, sd, multiplier=multiplier)
+...
+del sd                # release ~2-3 GB before returning
+return result
+```
+
+For the wrapper to do this, the loader has to be a separate call (so
+the wrapper owns the only reference). Hence the
+`load_lora_state_dict(path) → sd` helper as a distinct step before
+`merge_lora_into_model(dit, sd)`.
+
+**Rule for next port:** Whenever you load weights specifically to
+*compute a delta then discard*, the loader and the consumer should be
+separate calls in the same scope, and the consumer's scope should
+`del` the source immediately. MLX's lazy eval + unified memory means
+references held in Python keep tensors resident even after the model
+has "absorbed" them.
+
+**Skill update target:** add to `numerics.md` under a new section
+"Unified memory hygiene during weight ops." Cross-references the
+silent-zero-trap (`mx.eval` before save) — same kind of
+"physical-memory-vs-logical-state" mismatch.
+
+---
+
+## L41. Identical fast-mode flip across all CLIs → the orchestration layer is where it belongs
+
+**What we hit:** The `cfg_step_lora` merge is followed *every time* by
+the same 4 lines:
+
+```python
+cfg.cfg_collapse = True
+cfg.num_sampling_steps = 8
+cfg.text_guidance_scale = 0.0
+print(...)
+```
+
+Across 5 CLIs (`run_t2v`, `run_i2v`, `run_continuation`,
+`run_long_video`, `run_interactive`). The orchestration variants
+(Long-Video, Interactive) additionally need to flip the same on BOTH
+sub-pipelines (`pipeline.t2v.config` + `pipeline.continuation.config`).
+
+Today this is duplicated. The right shape is probably:
+
+```python
+# In _common.py:
+def apply_cfg_step_lora(pipeline, dit, variant_dir):
+    merge_lora(dit, variant_dir, "cfg_step_lora")
+    pipeline.set_fast_mode(num_steps=8)   # pipeline knows its own sub-configs
+```
+
+We didn't do this yet because the 4-line duplication is small and the
+shape of `set_fast_mode` would need to handle Long-Video / Interactive's
+two-sub-config case specifically. **Decision: leave the duplication for
+now; revisit when a 6th CLI shows up or a config field gets added.**
+
+**Rule for next port:** When wiring an opt-in capability (LoRA, BSA,
+quantization) across multiple CLIs, the moment you write the *third*
+near-identical block, move the orchestration step into the pipeline
+class or a shared `_common.py` helper. Two copies is a coincidence;
+three is a pattern.
+
+**Skill update target:** add to `repo-layout.md` under
+"CLI-vs-pipeline boundary" — the heuristic for "is this CLI plumbing
+or pipeline behavior?"
+
+---
+
+## L42. Two-pass and single-pass CFG branches must share timestep-shape normalization
+
+**What we hit:** The 2-pass baseline CFG path (`cfg_collapse=False`)
+had a defensive `if timestep.ndim == 0: timestep = timestep[None]` line
+right before `mx.repeat`. The single-pass `cfg_collapse=True` branch
+didn't — because it doesn't repeat. So a scalar (0-d) timestep from
+the scheduler trickled straight through to the DiT, which only
+checks `ndim == 1` for its `[B] → [B, N_t]` broadcast.
+
+Downstream consequence: `timestep.flatten()` on a 0-d array gives shape
+`(1,)`, not `(B*N_t,)`. The t_embedder produces a `[1, 512]` tensor;
+the `.reshape(B=1, N_t=2, -1)` call then *fits* that into shape
+`(1, 2, 256)` — silently corrupting the per-frame embedding dim from
+512 to 256.
+
+The crash showed up 200ms later at the next-block's `adaLN_modulation`
+linear, which expects 512-dim input. The error message **didn't point
+at the timestep** — it pointed at `addmm` shape mismatch in the
+modulation layer. Took source-walking the DiT forward to backtrack to
+the timestep flatten.
+
+This had been latent in the codebase since B1.3 (T2V pipeline). The
+baseline smoke test (4 steps × 5 frames, `cfg_collapse=False`) couldn't
+trigger it because the 2-pass branch had the normalization. The bug
+only manifested when we wired LoRA merge + flipped `cfg_collapse=True`
+in B1.6.
+
+**Rule for next port:** Any branch that takes a "scalar OR 1-D" input
+must do shape normalization in EVERY branch, not just the one that has
+a downstream op that errors loudly. The 2-pass branch had `mx.repeat`
+which would have errored on a 0-d input — that's WHY the normalization
+was there. The single-pass branch had no such loud-erroring op, so the
+normalization was forgotten — and the silent corruption rode all the
+way to the next-block.
+
+**Belt-and-suspenders fix:** normalize at the DiT entry as well:
+
+```python
+# Normalize scalar (ndim==0) → [B=1], then expand [B] → [B, N_t]
+if timestep.ndim == 0:
+    timestep = timestep[None]
+if timestep.ndim == 1:
+    timestep = mx.broadcast_to(timestep[:, None], (B, N_t))
+```
+
+That way no future call site can trip on the same trap — even if a
+test stub forgets the normalization, the model handles it.
+
+**Regression-test pattern that catches this in smoke:**
+
+```python
+class StubDiT:
+    def __call__(self, lat, t, *a, **kw):
+        received_ndim.append(int(t.ndim))
+        return mx.zeros_like(lat)
+
+pipe = LongCatVideoT2VPipeline(..., dit=StubDiT(), config=cfg_collapse_True)
+pipe._cfg_forward(latents=..., timestep=mx.array(500.0), ...)
+assert received_ndim == [1]
+```
+
+Stub the DiT, assert it receives a 1-D timestep. Locks the invariant
+without needing weights.
+
+**Skill update target:** add to `common-pitfalls.md` under a new
+"Branch parity" section. Cross-references L34 (mixed Q/K seq → opt out
+of BSA, don't toggle per-block) — same family: when you have two
+branches, audit them for *every* normalization the other branch does.
+
+---
+
 ## Toolkit candidates (running tally — Avatar + base)
 
 Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
@@ -610,12 +815,16 @@ Aggregating tagged lessons for the eventual `mlx-port-toolkit` extraction:
 - L21: `xcodebuild test` over `swift test` for metallib bundling
 - L22: bf16 GPU matmul Python-vs-Swift divergence
 
-**Added in this port (L23–L38):**
+**Added in this port (L23–L42):**
 - L23: Read published `config.json` before source-spelunking
 - L24: Degenerate-case correctness gate (`sparsity=0 ≡ dense`)
 - L27 (partial): Fresh-venv release check
 - L31 (partial): Separable resampling helper
 - L37 (partial): Coarse-to-fine `take` expansion table
 - L38: Per-component skip-done sentinels (reinforces Avatar pattern)
+- **L39: Merge wrapper must fail loudly on 0-modules-merged**
+- L40 (partial): Loader-vs-consumer separation for delta-then-discard
+- **L42: Branch parity — every branch must apply every normalization**
+  (the stub-DiT-receives-correct-ndim regression test pattern)
 
 When 3+ ports in a row use the same pattern, that's the extraction trigger.

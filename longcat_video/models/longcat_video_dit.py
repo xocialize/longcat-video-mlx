@@ -258,7 +258,9 @@ class LongCatVideoTransformer3DModel(nn.Module):
         N_h = H // self.patch_size[1]
         N_w = W // self.patch_size[2]
 
-        # Expand timestep from [B] to [B, N_t] if needed
+        # Normalize scalar (ndim==0) → [B=1], then expand [B] → [B, N_t]
+        if timestep.ndim == 0:
+            timestep = timestep[None]
         if timestep.ndim == 1:
             timestep = mx.broadcast_to(timestep[:, None], (B, N_t))
 
