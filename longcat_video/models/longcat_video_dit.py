@@ -192,7 +192,7 @@ class LongCatVideoTransformer3DModel(nn.Module):
 
     @classmethod
     def from_config(cls, config: dict) -> "LongCatVideoTransformer3DModel":
-        return cls(
+        model = cls(
             in_channels=config.get("in_channels", 16),
             out_channels=config.get("out_channels", 16),
             hidden_size=config.get("hidden_size", 4096),
@@ -205,6 +205,37 @@ class LongCatVideoTransformer3DModel(nn.Module):
             patch_size=tuple(config.get("patch_size", [1, 2, 2])),
             text_tokens_zero_pad=config.get("text_tokens_zero_pad", False),
         )
+        # Preserve published BSA params on the instance for `enable_bsa()` /
+        # `disable_bsa()` to apply. Defaults match the published config:
+        # sparsity=0.9375, chunk_3d_shape_q=[4,4,4].
+        bsa_params = config.get("bsa_params") or {}
+        model._bsa_sparsity = float(bsa_params.get("sparsity", 0.9375))
+        chunk = tuple(bsa_params.get("chunk_3d_shape_q", [4, 4, 4]))
+        model._bsa_chunk_thw = chunk
+        # Honor `enable_bsa: bool` from config (published default is False).
+        if config.get("enable_bsa", False):
+            model.enable_bsa()
+        return model
+
+    def enable_bsa(self) -> None:
+        """Turn on Block Sparse Attention across all 48 DiT blocks.
+
+        Used by the refinement pipeline before the 720p denoise loop.
+        BSA params are read from the published config's `bsa_params`
+        block (preserved on the instance by `from_config`).
+
+        See `models/block_sparse_attention.py` for the Tier A pure-MLX
+        implementation; Tier B is the upcoming Metal kernel (B4.1).
+        """
+        for block in self.blocks:
+            block.attn.enable_bsa = True
+            block.attn.bsa_sparsity = self._bsa_sparsity
+            block.attn.bsa_chunk_thw = self._bsa_chunk_thw
+
+    def disable_bsa(self) -> None:
+        """Turn off Block Sparse Attention across all 48 DiT blocks."""
+        for block in self.blocks:
+            block.attn.enable_bsa = False
 
     def __call__(
         self,

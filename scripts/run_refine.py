@@ -111,13 +111,15 @@ def build_pipeline(
     lora_path = variant_dir / "lora" / "refinement_lora.safetensors"
     hot_swap_refinement_lora(dit, lora_path)
 
-    # Enable BSA (the DiT exposes this as a config flag; flip on instance)
-    if hasattr(dit, "enable_bsa"):
-        dit.enable_bsa = True
-        print("  [refinement] BSA enabled on DiT")
+    # Enable BSA across all 48 DiT blocks (B3.2 Tier A pure-MLX
+    # reference; Tier B Metal kernel lands in B4.1).
+    if hasattr(dit, "enable_bsa") and callable(dit.enable_bsa):
+        dit.enable_bsa()
+        print(f"  [refinement] BSA enabled on DiT (sparsity={dit._bsa_sparsity}, "
+              f"chunk={dit._bsa_chunk_thw}) — Tier A pure-MLX")
     else:
-        print("  [refinement] WARNING: dit has no `enable_bsa` attr — "
-              "BSA Tier A lands in B3.2; refinement will fall back to dense attention")
+        print("  [refinement] WARNING: dit has no `enable_bsa` method — "
+              "refinement will fall back to dense attention")
 
     cfg = RefinementPipelineConfig(
         target_height=target_height,
