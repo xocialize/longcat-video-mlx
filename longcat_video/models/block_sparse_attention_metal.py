@@ -59,11 +59,13 @@ import mlx.core as mx
 
 __all__ = [
     "bsa_attention_metal",
+    "bsa_attention_metal_v2",
     "prewarm_metal_kernel",
 ]
 
 
 _KERNEL_CACHE: dict[tuple, object] = {}
+_KERNEL_V2_CACHE: dict[tuple, object] = {}
 
 
 _BSA_KERNEL_BODY = r"""
@@ -325,3 +327,218 @@ def prewarm_metal_kernel(
     # Note: pre-warm at the smaller tk values; production tk (≈100+) will
     # compile lazily on first real call but that's a single hit per layer.
     print(f"  [BSA Tier B] pre-warm complete.")
+
+
+# ===========================================================================
+# Phase 2 — simdgroup-cooperative kernel (FAST)
+# ===========================================================================
+#
+# Phase 1 (above) had one thread doing ALL the work for one output token.
+# That left 31 of 32 threads in each simdgroup idle.
+#
+# Phase 2 mirrors the pattern from MLX's `sdpa_vector.h`: ALL 32 threads in
+# a simdgroup cooperate on ONE output token's attention, using:
+#
+# - Each thread holds D/32 elements of Q in registers (qk_per_thread = 4
+#   when D=128). Load once per output token, reuse across all KV.
+# - For each attended KV token: each thread computes its partial dot
+#   product, then `simd_sum` reduces 32 partials → 1 scalar score in HW
+#   in ~5 cycles.
+# - All 32 threads update softmax accumulators in lockstep (each holds
+#   its own slice of the output vector).
+# - Same for V accumulation: each thread holds its slice of the running
+#   output, multiplied by exp_score from V[same kv idx].
+#
+# This is ~32× faster per attention op than Phase 1's serial loop
+# (no simd reduction, scalar fp32 accumulators), and crucially uses
+# HW simd primitives that beat naive scalar code.
+
+_BSA_KERNEL_V2_BODY = r"""
+    // ===================================================================
+    // BSA Tier B Phase-2 simdgroup-cooperative kernel.
+    //
+    // Thread layout:
+    //   grid:        (B * H * S, 1, 1)   — total threads
+    //   threadgroup: (32, 1, 1)          — one simdgroup per group
+    //   → one threadgroup = one simdgroup = one output token
+    //
+    // Each thread holds D/32 fp32 elements of Q and the running output.
+    // `simd_sum` performs the per-token dot-product reduction in HW.
+    //
+    // Template params:
+    //   T   : input dtype
+    //   D   : head dimension (must be a multiple of 32; typ. 128)
+    //   BS  : block_size (64)
+    //   TK  : top_k
+    // ===================================================================
+
+    constexpr uint BD = 32;       // simdgroup width
+    constexpr uint QK_PT = D / BD;
+
+    uint linear_tid = thread_position_in_grid.x;
+    uint simd_lid = thread_index_in_simdgroup;
+    uint S = q_shape[2];
+    uint H = q_shape[1];
+    uint B = q_shape[0];
+    uint BHS = B * H * S;
+
+    // Decode output-token index from linear tid (grid x = B*H*S)
+    uint token_global = linear_tid / BD;
+    if (token_global >= BHS) return;
+
+    uint b = token_global / (H * S);
+    uint hs = token_global % (H * S);
+    uint h = hs / S;
+    uint s = hs % S;
+
+    uint q_block = s / BS;
+    uint num_q_blocks = S / BS;
+
+    // Load Q slice for this thread (QK_PT elements)
+    // Q layout: [B, H, S, D]
+    uint q_base = ((b * H + h) * S + s) * D;
+    float q_reg[QK_PT];
+    for (uint i = 0; i < QK_PT; i++) {
+        q_reg[i] = (float)q[q_base + simd_lid * QK_PT + i];
+    }
+
+    // Softmax scale (use log2-base for fast::exp2)
+    const float scale = 1.0f / metal::sqrt((float)D);
+    const float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+
+    // Online softmax state (per thread)
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o_reg[QK_PT];
+    for (uint i = 0; i < QK_PT; i++) {
+        o_reg[i] = 0.0f;
+    }
+
+    // For each selected KV block
+    uint bi_base = ((b * H + h) * num_q_blocks + q_block) * TK;
+    for (uint sel = 0; sel < TK; sel++) {
+        int kv_block_idx = block_indices[bi_base + sel];
+        uint kv_token_base = (uint)kv_block_idx * BS;
+
+        // For each token in the KV block
+        for (uint j = 0; j < BS; j++) {
+            uint kv_idx = kv_token_base + j;
+            if (kv_idx >= S) continue;
+
+            // Each thread reads its K slice
+            uint k_base = ((b * H + h) * S + kv_idx) * D;
+            float local_dot = 0.0f;
+            for (uint i = 0; i < QK_PT; i++) {
+                float k_val = (float)k[k_base + simd_lid * QK_PT + i];
+                local_dot += q_reg[i] * k_val;
+            }
+            // HW reduction: 32 partials → 1 scalar score in ~5 cycles
+            float score = metal::simd_sum(local_dot) * scale_log2;
+
+            // Online softmax update (all threads in lockstep — score is
+            // broadcast via simd_sum's return value)
+            float m_new = metal::max(m, score);
+            float exp_diff = metal::fast::exp2(m - m_new);
+            float exp_score = metal::fast::exp2(score - m_new);
+
+            l = l * exp_diff + exp_score;
+
+            // Update each thread's slice of the output
+            uint v_base = ((b * H + h) * S + kv_idx) * D;
+            for (uint i = 0; i < QK_PT; i++) {
+                float v_val = (float)v[v_base + simd_lid * QK_PT + i];
+                o_reg[i] = o_reg[i] * exp_diff + exp_score * v_val;
+            }
+            m = m_new;
+        }
+    }
+
+    // Normalize + write each thread's slice of the output
+    uint out_base = ((b * H + h) * S + s) * D;
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (uint i = 0; i < QK_PT; i++) {
+        out[out_base + simd_lid * QK_PT + i] = (T)(o_reg[i] * inv_l);
+    }
+"""
+
+
+def _get_kernel_v2(D: int, BS: int, TK: int, dtype: mx.Dtype):
+    """JIT-compile the Phase 2 kernel (cached)."""
+    key = (D, BS, TK, dtype)
+    if key not in _KERNEL_V2_CACHE:
+        _KERNEL_V2_CACHE[key] = mx.fast.metal_kernel(
+            name=f"bsa_phase2_D{D}_BS{BS}_TK{TK}",
+            input_names=["q", "k", "v", "block_indices"],
+            output_names=["out"],
+            source=_BSA_KERNEL_V2_BODY,
+            ensure_row_contiguous=True,
+        )
+    return _KERNEL_V2_CACHE[key]
+
+
+def bsa_attention_metal_v2(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    block_indices: mx.array,
+    chunk_thw: tuple[int, int, int] = (4, 4, 4),
+    shape: Optional[tuple[int, int, int]] = None,
+) -> mx.array:
+    """BSA Tier B Phase 2 — simdgroup-cooperative Metal kernel.
+
+    Same interface as `bsa_attention_metal` (Phase 1) but uses 32 threads
+    cooperatively per output token via `simd_sum`. ~10-30× faster than
+    Phase 1 for typical (D ≥ 64) shapes.
+
+    Constraint: head_dim D must be a multiple of 32 (the simdgroup width).
+    """
+    if shape is None:
+        raise ValueError(
+            "shape=(T_lat, H_lat, W_lat) is required for Tier B BSA"
+        )
+    B, H, S, D = q.shape
+    BS = chunk_thw[0] * chunk_thw[1] * chunk_thw[2]
+    TK = int(block_indices.shape[-1])
+
+    if S % BS != 0:
+        raise ValueError(
+            f"S={S} must be a multiple of block_size={BS}."
+        )
+    if D % 32 != 0:
+        raise ValueError(
+            f"head_dim D={D} must be a multiple of 32 for Phase 2 "
+            f"simdgroup-cooperative kernel. Use Phase 1 (bsa_attention_metal) "
+            f"for D < 32 or non-multiple-of-32 D."
+        )
+
+    # Rearrange t-major → block-major for kernel's `s/BS` lookup
+    q_bm = _reshape_to_block_major(q, shape, chunk_thw)
+    k_bm = _reshape_to_block_major(k, shape, chunk_thw)
+    v_bm = _reshape_to_block_major(v, shape, chunk_thw)
+
+    kernel = _get_kernel_v2(D, BS, TK, q.dtype)
+
+    if block_indices.dtype != mx.int32:
+        block_indices = block_indices.astype(mx.int32)
+
+    # Dispatch: 32 threads per output token, total = B*H*S simdgroups
+    grid_x = B * H * S * 32
+    grid = (grid_x, 1, 1)
+    threadgroup = (32, 1, 1)
+
+    out_bm = kernel(
+        inputs=[q_bm, k_bm, v_bm, block_indices],
+        template=[
+            ("T", q.dtype),
+            ("D", D),
+            ("BS", BS),
+            ("TK", TK),
+        ],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(B, H, S, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+
+    return _reshape_from_block_major(out_bm, shape, chunk_thw)

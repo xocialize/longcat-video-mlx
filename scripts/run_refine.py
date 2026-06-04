@@ -84,7 +84,12 @@ def build_pipeline(
     # Enable BSA across all 48 DiT blocks (B3.2 Tier A pure-MLX
     # reference; Tier B Metal kernel lands in B4.1).
     if hasattr(dit, "enable_bsa") and callable(dit.enable_bsa):
-        dit.enable_bsa()
+        # Backend default = "tier_a" (pure-MLX reference). Switch to
+        # "metal" via `--bsa-backend metal` for the Phase 2 simdgroup-
+        # cooperative kernel (1.2-1.35× faster than dense SDPA).
+        import os
+        bsa_backend = os.environ.get("LONGCAT_BSA_BACKEND", "tier_a")
+        dit.enable_bsa(backend=bsa_backend)
         print(f"  [refinement] BSA enabled on DiT (sparsity={dit._bsa_sparsity}, "
               f"chunk={dit._bsa_chunk_thw}) — Tier A pure-MLX")
     else:

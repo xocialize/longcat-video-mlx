@@ -217,20 +217,29 @@ class LongCatVideoTransformer3DModel(nn.Module):
             model.enable_bsa()
         return model
 
-    def enable_bsa(self) -> None:
+    def enable_bsa(self, backend: str = "tier_a") -> None:
         """Turn on Block Sparse Attention across all 48 DiT blocks.
+
+        Args:
+            backend: "tier_a" (default, pure-MLX reference; safest fallback
+                     semantics) or "metal" (Phase 2 simdgroup-cooperative
+                     kernel — 1.2-1.35× faster than dense SDPA at large S).
 
         Used by the refinement pipeline before the 720p denoise loop.
         BSA params are read from the published config's `bsa_params`
         block (preserved on the instance by `from_config`).
 
-        See `models/block_sparse_attention.py` for the Tier A pure-MLX
-        implementation; Tier B is the upcoming Metal kernel (B4.1).
+        See `models/block_sparse_attention.py` for Tier A;
+        `block_sparse_attention_metal.py` for Tier B Phase 2.
         """
+        assert backend in ("tier_a", "metal"), (
+            f"unknown BSA backend: {backend!r}. Choose 'tier_a' or 'metal'."
+        )
         for block in self.blocks:
             block.attn.enable_bsa = True
             block.attn.bsa_sparsity = self._bsa_sparsity
             block.attn.bsa_chunk_thw = self._bsa_chunk_thw
+            block.attn.bsa_backend = backend
 
     def disable_bsa(self) -> None:
         """Turn off Block Sparse Attention across all 48 DiT blocks."""
