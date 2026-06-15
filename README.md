@@ -4,15 +4,13 @@ Apple MLX port of [LongCat-Video](https://github.com/meituan-longcat/LongCat-Vid
 Meituan's 13.6 B-parameter video diffusion model — for inference on Apple
 Silicon (M-series).
 
-> **Status: production-tier.** Three variants live on HF — pick by RAM
+> **Status: production-tier.** Three quantization variants live on HF — pick by RAM
 > budget. Part of the
 > [LongCat-Video — MLX](https://huggingface.co/collections/mlx-community/longcat-video-mlx-6a216a3576c098e83c1cc167) collection.
-> All six task variants ship and verify; DiT block parity vs PT
-> reference is **8.94e-08 (fp32 precision noise)**; the 720p refinement
-> pass has a 4-phase Metal kernel ladder culminating in a
-> **`simdgroup_matrix` HW-accelerated implementation 2.55× faster than
-> dense `mx.fast.scaled_dot_product_attention`** at production sequence
-> lengths.
+> All six task variants ship and verify; DiT block parity vs the PT reference is
+> **8.94e-08 (fp32 precision noise)**; the 720p refinement pass has a Block Sparse
+> Attention Metal-kernel ladder culminating in a `simdgroup_matrix` HW-accelerated
+> kernel.
 >
 > Companion repo [xocialize/longcat-avatar-mlx](https://github.com/xocialize/longcat-avatar-mlx)
 > ports the Avatar 1.5 variant of the same architecture — start there
@@ -26,70 +24,85 @@ Silicon (M-series).
 | [**q8**](https://huggingface.co/mlx-community/LongCat-Video-q8) | 15 GB | 31 GB | 48 GB | very close to bf16 | ✅ |
 | [**q4**](https://huggingface.co/mlx-community/LongCat-Video-q4) | 9 GB | 25 GB | 32 GB | minor degradation | ✅ |
 
-CLIs accept `--variant {auto, bf16, q4, q8}`. Default is `auto` — picks
-bf16 if available, falls back to q8 then q4. Just download whichever
-variant fits your Mac.
+All CLIs accept `--variant {auto, bf16, q4, q8}`. Default is `auto` — picks
+bf16 if available, falls back to q8 then q4.
 
 ## Six task variants, one DiT checkpoint
 
-| Variant | Pipeline | Status |
+Each task has a `pipeline_*` module (the library API) and a `run_*.py` CLI under `scripts/`:
+
+| Task | Pipeline module | CLI |
 |---|---|---|
-| **T2V** — text-to-video | `pipeline_t2v` | ✅ shipped (B1.3 + B1.4 + golden smoke) |
-| **I2V** — image-to-video | `pipeline_i2v` | ✅ shipped (B2.1) |
-| **Video Continuation** | `pipeline_continuation` | ✅ shipped (B2.2) |
-| **720p / 30fps refinement** | `refinement.py` (+ BSA) | ✅ shipped (B3.1 + B3.2 Tier A + B4.1 Tier B Phase 1–4) |
-| **Long-Video** (chained continuation) | `pipeline_long_video` | ✅ shipped (B5.1) |
-| **Interactive Video** (per-segment prompts) | `pipeline_interactive` | ✅ shipped (B5.2) |
-| Streamlit UI | — | Out of scope (use CLI) |
+| **T2V** — text-to-video | `pipeline_t2v` | `scripts/run_t2v.py` |
+| **I2V** — image-to-video | `pipeline_i2v` | `scripts/run_i2v.py` |
+| **Video Continuation** | `pipeline_continuation` | `scripts/run_continuation.py` |
+| **720p / 30fps refinement** (+ BSA) | `refinement` | `scripts/run_refine.py` |
+| **Long-Video** (chained continuation) | `pipeline_long_video` | `scripts/run_long_video.py` |
+| **Interactive Video** (per-segment prompts) | `pipeline_interactive` | `scripts/run_interactive.py` |
 
 All six are driven by the same 13.6B DiT with optional LoRAs:
-- `cfg_step_lora` collapses CFG branches + reduces sampler step count
+- `cfg_step_lora` collapses CFG branches + reduces sampler step count (`--cfg-step-lora`)
 - `refinement_lora` enables the 720p / 30fps refinement pass
 
-## Block Sparse Attention — four-phase Metal kernel ladder
+Example:
+
+```bash
+python scripts/run_t2v.py \
+    --weights /path/to/mlx-weights --variant auto \
+    --prompt "a fox running through autumn leaves" \
+    --num-frames 24 --height 480 --width 832 --seed 42 --out out.mp4
+```
+
+## Block Sparse Attention — Metal kernel ladder
 
 The 720p refinement pass uses Block Sparse Attention (sparsity=0.9375,
-block_size=64) — a custom routing-then-attend op where each Q block
-attends to only 6.25% of the KV blocks. We shipped **five backends**;
-the default `--variant`-aware dispatcher picks the right one based on
-sequence length and dtype:
+block_size=64) — each Q block attends to only 6.25% of the KV blocks. Enable it on
+a DiT via `dit.enable_bsa(backend=...)`:
 
-| Backend | Speed @ S=12.8K, D=128 | Use case |
-|---|---|---|
-| **Tier A pure-MLX** | 64 ms (~2× slower than dense) | Reference / correctness fallback |
-| **Tier B Phase 1** (naive kernel) | 154 ms | Educational; doesn't beat dense |
-| **Tier B Phase 2** (simdgroup-cooperative) | 63.5 ms | fp32 paths, small head dims |
-| **Tier B Phase 3** (threadgroup-shared K+V) | 41.1 ms | Any non-fp16 BSA case |
-| **Tier B Phase 4** (`simdgroup_matrix` HW matmul) | **25.6 ms** | fp16 + D%32==0 + S≥1280 → **2.55× faster than dense `mx.fast.scaled_dot_product_attention`** |
+| `backend=` | Implementation |
+|---|---|
+| `"tier_a"` (default) | Pure-MLX reference (correctness fallback) |
+| `"metal"` | Auto-selecting: Phase 4 (`simdgroup_matrix` HW matmul) when fp16 + BS=64 + D%32==0 + S≥1280; else Phase 3 (threadgroup-shared K+V); else Phase 2 (simdgroup-cooperative) |
+| `"metal_v2"` / `"metal_v3"` / `"metal_v4"` | Explicit Phase 2 / 3 / 4 |
 
-The auto-selecting dispatcher (`enable_bsa(backend="metal")`) picks
-**Phase 4 > Phase 3 > Phase 2** based on constraints + S. Each phase is
-a separate skill-lessons entry (L51–L59) documenting the Metal kernel
-patterns that worked at each level.
+The Tier A backend lives in `models/block_sparse_attention.py`; the Phase 1–4 Metal
+kernels live in `models/block_sparse_attention_metal.py`. The refinement CLI selects the
+backend via the `LONGCAT_BSA_BACKEND` environment variable (default `tier_a`):
 
-## Reuse from the Avatar port
+```bash
+LONGCAT_BSA_BACKEND=metal python scripts/run_refine.py --weights … --stage1 … --prompt …
+```
 
-The Avatar port ([xocialize/longcat-avatar-mlx](https://github.com/xocialize/longcat-avatar-mlx))
-already ships the shared architectural components — Wan VAE, umT5-XXL, base
-DiT, attention primitives, blocks, 3D RoPE, LoRA loader. This repo
-**copy-vendors** those modules (no cross-repo dependency at runtime) so it
-can be developed and released independently.
+## Dependencies / reuse
 
-## Original 5-week plan — all stages shipped
+The shared Wan-family modules (Wan VAE, umT5-XXL, base DiT, attention, 3D RoPE, LoRA
+loader) are **copy-vendored** into `longcat_video/models/` so the package develops and
+releases independently of the Avatar port. The default Flow-Matching scheduler is
+provided at runtime by **[`mlx-arsenal`](https://pypi.org/project/mlx-arsenal/)**
+(`mlx_arsenal.diffusion.FlowMatchEulerDiscreteScheduler`), a hard runtime dependency
+declared in `pyproject.toml` (`mlx-arsenal>=0.10`).
+
+## Install
+
+```bash
+pip install -e .                 # runtime: mlx, mlx-arsenal, safetensors, hf_hub, numpy, Pillow, imageio
+pip install -e ".[parity]"       # + torch/transformers/diffusers/einops for PT parity tests
+pip install -e ".[dev]"          # parity + pytest + ruff
+```
+
+## Original plan — all stages shipped
 
 | Stage | Work | Status |
 |---|---|---|
 | **B0** | Scaffold + copy-vendor reusable modules | ✅ |
-| **B1** | Convert base DiT + LoRAs, T2V pipeline + CLI, publish bf16 | ✅ |
+| **B1** | Base DiT + LoRAs, T2V pipeline + CLI, publish bf16 | ✅ |
 | **B1.6** | LoRA merge wiring across CLIs + cfg_collapse fix | ✅ |
 | **B2** | I2V + Continuation pipelines | ✅ |
-| **B3** | Coarse-to-fine refinement + Block Sparse Attention (Tier A) | ✅ |
-| **B4** | Block Sparse Attention (Tier B Metal kernel, 4 phases) | ✅ |
+| **B3** | Coarse-to-fine refinement + BSA (Tier A) | ✅ |
+| **B4** | BSA Tier B Metal kernel (Phases 1–4) | ✅ |
 | **B5** | Long-Video + Interactive + MOS parity + q4/q8 publish | ✅ |
 
-Full plan in [`../XDocs/LongCat-Video-Base-MLX-Port-Plan-v1.md`](../XDocs/LongCat-Video-Base-MLX-Port-Plan-v1.md).
-Per-stage development notes + skill lessons in
-[`docs/development/`](docs/development/).
+Per-stage development notes in [`docs/development/`](docs/development/).
 
 ## License
 
